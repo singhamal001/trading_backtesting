@@ -2,7 +2,7 @@
 import pandas as pd
 from datetime import timedelta 
 
-import config
+import config # Ensure config has TP_RR_RATIO, HTF_TIMEDELTA, PIP_SIZE, SL_BUFFER_PIPS
 from strategies import get_strategy_class 
 from plotly_plotting import plot_trade_chart_plotly 
 
@@ -11,6 +11,7 @@ def get_pip_size(symbol: str) -> float:
         if key_part in symbol.upper():
             return config.PIP_SIZE[key_part]
     if "JPY" in symbol.upper(): return 0.01 
+    if "XAU" in symbol.upper(): return 0.01
     return 0.0001
 
 def is_time_allowed(timestamp_utc: pd.Timestamp) -> bool:
@@ -38,7 +39,7 @@ def run_backtest(
     trades_log = []
     active_trade = None
     pip_size = get_pip_size(symbol)
-    sl_buffer_price = config.SL_BUFFER_PIPS * pip_size
+    sl_buffer_price_config = config.SL_BUFFER_PIPS * pip_size # Buffer for initial SL from swing
     current_overall_trade_id = starting_trade_id -1 
 
     StrategyClass = get_strategy_class(strategy_name)
@@ -47,7 +48,7 @@ def run_backtest(
         return [], starting_trade_id -1 
     
     common_strategy_params = {
-        "symbol": symbol, "pip_size": pip_size, "sl_buffer_price": sl_buffer_price,
+        "symbol": symbol, "pip_size": pip_size, "sl_buffer_price": sl_buffer_price_config, # Pass the calculated buffer
         "htf_timeframe_str": config.HTF_TIMEFRAME_STR, "ltf_timeframe_str": config.LTF_TIMEFRAME_STR,
     }
     strategy_instance = StrategyClass(strategy_custom_params, common_strategy_params)
@@ -70,14 +71,32 @@ def run_backtest(
             for ltf_idx, ltf_candle in ltf_management_slice.iterrows():
                 active_trade['last_checked_ltf_time'] = ltf_idx
                 
-                if active_trade.get('max_R_achieved_for_analysis', 0.0) < 5.0 or active_trade['status'] == 'open': # Continue R analysis if not capped or trade still open
-                    risk_in_price = abs(active_trade['entry_price'] - active_trade['sl_price'])
-                    if risk_in_price > 1e-9:
+                # --- Stop to Breakeven Logic (if not already done and trade is open) ---
+                if not active_trade['stop_moved_to_be'] and active_trade['status'] == 'open':
+                    one_r_profit_target_price = 0.0
+                    if active_trade['direction'] == 'bullish':
+                        one_r_profit_target_price = active_trade['entry_price'] + active_trade['initial_risk_in_price']
+                        if ltf_candle['high'] >= one_r_profit_target_price:
+                            active_trade['sl_price'] = active_trade['entry_price'] # Move SL to BE
+                            active_trade['stop_moved_to_be'] = True
+                            print(f"    Trade ID {active_trade['id']}: Stop moved to Breakeven at {ltf_idx}. New SL: {active_trade['sl_price']:.5f}")
+                    elif active_trade['direction'] == 'bearish':
+                        one_r_profit_target_price = active_trade['entry_price'] - active_trade['initial_risk_in_price']
+                        if ltf_candle['low'] <= one_r_profit_target_price:
+                            active_trade['sl_price'] = active_trade['entry_price'] # Move SL to BE
+                            active_trade['stop_moved_to_be'] = True
+                            print(f"    Trade ID {active_trade['id']}: Stop moved to Breakeven at {ltf_idx}. New SL: {active_trade['sl_price']:.5f}")
+
+                # --- R-level and Max Potential R Tracking (uses initial_risk_in_price) ---
+                if active_trade.get('max_R_achieved_for_analysis', 0.0) < 5.0: 
+                    # Use initial_risk_in_price for consistent R calculation
+                    initial_risk = active_trade['initial_risk_in_price'] 
+                    if initial_risk > 1e-9: # Avoid division by zero
                         current_potential_R = 0.0
                         if active_trade['direction'] == 'bullish': 
-                            current_potential_R = (ltf_candle['high'] - active_trade['entry_price']) / risk_in_price
+                            current_potential_R = (ltf_candle['high'] - active_trade['entry_price']) / initial_risk
                         elif active_trade['direction'] == 'bearish': 
-                            current_potential_R = (active_trade['entry_price'] - ltf_candle['low']) / risk_in_price
+                            current_potential_R = (active_trade['entry_price'] - ltf_candle['low']) / initial_risk
                         
                         active_trade['max_R_achieved_for_analysis'] = max(
                             active_trade.get('max_R_achieved_for_analysis', 0.0), 
@@ -92,24 +111,26 @@ def run_backtest(
                             if not active_trade.get(f'{r_target}R_achieved', False) and current_potential_R >= r_target:
                                 active_trade[f'{r_target}R_achieved'] = True
                 
-                if active_trade['status'] == 'open': # Only check SL/TP if trade is actually open
+                # --- Actual SL/TP Hit Check (only if trade is still 'open') ---
+                if active_trade['status'] == 'open':
                     if active_trade['direction'] == 'bullish':
                         if ltf_candle['low'] <= active_trade['sl_price']: 
-                            active_trade['status'] = 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']
-                            print(f"    Trade SL: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['sl_price']:.5f}")
+                            active_trade['status'] = 'closed_sl_be' if active_trade['stop_moved_to_be'] else 'closed_sl'
+                            active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']
+                            print(f"    Trade SL/{'BE' if active_trade['stop_moved_to_be'] else ''}: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['sl_price']:.5f}")
                             break 
                         elif ltf_candle['high'] >= active_trade['tp_price']: 
                             active_trade['status'] = 'closed_tp'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['tp_price']
                             for r_target in strategy_instance.get_r_levels_to_track():
                                 if r_target <= strategy_instance.tp_rr_ratio: active_trade[f'{r_target}R_achieved'] = True
-                            # Ensure max_R_achieved_for_analysis reflects at least TP if TP is hit
                             active_trade['max_R_achieved_for_analysis'] = max(active_trade.get('max_R_achieved_for_analysis', 0.0), min(strategy_instance.tp_rr_ratio, 5.0))
                             print(f"    Trade TP: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['tp_price']:.5f}")
-                            # No break here for TP, R-analysis continues on this candle, but status is now closed_tp
+                            # R-analysis continues on this candle if TP hit, status is now closed_tp
                     elif active_trade['direction'] == 'bearish':
                         if ltf_candle['high'] >= active_trade['sl_price']: 
-                            active_trade['status'] = 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']
-                            print(f"    Trade SL: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['sl_price']:.5f}")
+                            active_trade['status'] = 'closed_sl_be' if active_trade['stop_moved_to_be'] else 'closed_sl'
+                            active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']
+                            print(f"    Trade SL/{'BE' if active_trade['stop_moved_to_be'] else ''}: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['sl_price']:.5f}")
                             break
                         elif ltf_candle['low'] <= active_trade['tp_price']: 
                             active_trade['status'] = 'closed_tp'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['tp_price']
@@ -118,10 +139,10 @@ def run_backtest(
                             active_trade['max_R_achieved_for_analysis'] = max(active_trade.get('max_R_achieved_for_analysis', 0.0), min(strategy_instance.tp_rr_ratio, 5.0))
                             print(f"    Trade TP: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['tp_price']:.5f}")
             
-            if active_trade['status'] != 'open': # If SL was hit (TP status allows R-analysis to continue for current candle)
+            if active_trade['status'] != 'open': 
                 active_trade = None 
         
-        if not active_trade:
+        if not active_trade: # Look for new entry
             htf_signal = strategy_instance.check_htf_condition(prepared_htf_data, i)
             if htf_signal:
                 print(f"\n{current_htf_candle_time}: HTF Signal ({htf_signal['type']}) detected for {strategy_name}. Level: {htf_signal.get('level_broken', 'N/A'):.5f}")
@@ -147,10 +168,16 @@ def run_backtest(
                             if entry_time not in ltf_data_original_ohlc.index: continue
                             entry_price = ltf_data_original_ohlc.loc[entry_time]['open']
                             
-                            sl_price, tp_price = strategy_instance.calculate_sl_tp(
+                            initial_sl_price_calc, tp_price = strategy_instance.calculate_sl_tp( # Renamed for clarity
                                 entry_price, entry_time, prepared_ltf_data, ltf_entry_signal, htf_signal
                             )
-                            if sl_price is None or tp_price is None: break 
+                            if initial_sl_price_calc is None or tp_price is None: break 
+
+                            initial_risk_val = abs(entry_price - initial_sl_price_calc)
+                            if initial_risk_val < pip_size: # Ensure minimal risk
+                                print(f"    Warning: Initial risk too small ({initial_risk_val:.5f}) for trade at {entry_time}. Skipping.")
+                                break
+
 
                             current_overall_trade_id += 1 
                             print(f"    {entry_time}: LTF ENTRY SIGNAL ({strategy_name})! Type: {ltf_entry_signal['type']}, Price: {entry_price:.5f}")
@@ -160,19 +187,23 @@ def run_backtest(
                                 "symbol": symbol, "strategy": strategy_name,
                                 "entry_time": entry_time, "entry_price": entry_price,
                                 "direction": htf_signal["required_ltf_direction"],
-                                "sl_price": sl_price, "tp_price": tp_price,
+                                "initial_sl_price": initial_sl_price_calc, # Store initial SL
+                                "sl_price": initial_sl_price_calc,       # Current SL starts as initial SL
+                                "tp_price": tp_price,
+                                "initial_risk_in_price": initial_risk_val, # Store initial risk
+                                "stop_moved_to_be": False,                 # New flag
                                 "htf_signal_details": htf_signal, "ltf_signal_details": ltf_entry_signal,
                                 "status": "open", "exit_time": None, "exit_price": None,
                                 "pnl_pips": None, "pnl_R": None,
                                 "last_checked_ltf_time": entry_time, 
-                                'max_R_achieved_for_analysis': 0.0 # Use this name
+                                'max_R_achieved_for_analysis': 0.0 
                             }
                             r_levels_to_init = strategy_instance.get_r_levels_to_track() + [3.5, 4.0, 4.5, 5.0]
                             for r_val in sorted(list(set(r_levels_to_init))):
                                 if r_val <= 5.0: active_trade[f'{r_val}R_achieved'] = False
                             
                             trades_log.append(active_trade)
-                            print(f"    Trade Opened: ID {active_trade['id']} ({active_trade['symbol_specific_id']}-{symbol}) {active_trade['direction']} at {active_trade['entry_price']:.5f}, SL: {active_trade['sl_price']:.5f}, TP: {active_trade['tp_price']:.5f}")
+                            print(f"    Trade Opened: ID {active_trade['id']} ({active_trade['symbol_specific_id']}-{symbol}) {active_trade['direction']} at {active_trade['entry_price']:.5f}, Initial SL: {active_trade['initial_sl_price']:.5f}, TP: {active_trade['tp_price']:.5f}")
                             
                             active_trade['overall_trade_id'] = active_trade['id'] 
                             plot_trade_chart_plotly(active_trade, session_results_path) 
@@ -183,12 +214,27 @@ def run_backtest(
         ltf_final_slice = ltf_data_original_ohlc[ltf_data_original_ohlc.index > active_trade['last_checked_ltf_time']]
         for ltf_idx, ltf_candle in ltf_final_slice.iterrows(): 
             active_trade['last_checked_ltf_time'] = ltf_idx
+            # --- Stop to BE for EOD section ---
+            if not active_trade['stop_moved_to_be'] and active_trade['status'] == 'open':
+                one_r_profit_target_price = 0.0
+                if active_trade['direction'] == 'bullish':
+                    one_r_profit_target_price = active_trade['entry_price'] + active_trade['initial_risk_in_price']
+                    if ltf_candle['high'] >= one_r_profit_target_price:
+                        active_trade['sl_price'] = active_trade['entry_price']; active_trade['stop_moved_to_be'] = True
+                        print(f"    Trade ID {active_trade['id']}: Stop moved to BE (EOD Check) at {ltf_idx}.")
+                elif active_trade['direction'] == 'bearish':
+                    one_r_profit_target_price = active_trade['entry_price'] - active_trade['initial_risk_in_price']
+                    if ltf_candle['low'] <= one_r_profit_target_price:
+                        active_trade['sl_price'] = active_trade['entry_price']; active_trade['stop_moved_to_be'] = True
+                        print(f"    Trade ID {active_trade['id']}: Stop moved to BE (EOD Check) at {ltf_idx}.")
+
+            # --- R-level and Max Potential R Tracking for EOD section ---
             if active_trade.get('max_R_achieved_for_analysis', 0.0) < 5.0 or active_trade['status'] == 'open':
-                risk_in_price = abs(active_trade['entry_price'] - active_trade['sl_price'])
-                if risk_in_price > 1e-9:
+                initial_risk = active_trade['initial_risk_in_price']
+                if initial_risk > 1e-9:
                     current_potential_R = 0.0
-                    if active_trade['direction'] == 'bullish': current_potential_R = (ltf_candle['high'] - active_trade['entry_price']) / risk_in_price
-                    elif active_trade['direction'] == 'bearish': current_potential_R = (active_trade['entry_price'] - ltf_candle['low']) / risk_in_price
+                    if active_trade['direction'] == 'bullish': current_potential_R = (ltf_candle['high'] - active_trade['entry_price']) / initial_risk
+                    elif active_trade['direction'] == 'bearish': current_potential_R = (active_trade['entry_price'] - ltf_candle['low']) / initial_risk
                     active_trade['max_R_achieved_for_analysis'] = max(active_trade.get('max_R_achieved_for_analysis', 0.0), min(current_potential_R, 5.0))
                     r_levels_to_check_for_analysis = strategy_instance.get_r_levels_to_track() + [3.5, 4.0, 4.5, 5.0]
                     for r_target in sorted(list(set(r_levels_to_check_for_analysis))):
@@ -197,10 +243,10 @@ def run_backtest(
             
             if active_trade['status'] == 'open': 
                 if active_trade['direction'] == 'bullish': 
-                    if ltf_candle['low'] <= active_trade['sl_price']: active_trade['status'] = 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']; break 
+                    if ltf_candle['low'] <= active_trade['sl_price']: active_trade['status'] = 'closed_sl_be' if active_trade['stop_moved_to_be'] else 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']; break 
                     elif ltf_candle['high'] >= active_trade['tp_price']: active_trade['status'] = 'closed_tp'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['tp_price']
                 elif active_trade['direction'] == 'bearish': 
-                    if ltf_candle['high'] >= active_trade['sl_price']: active_trade['status'] = 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']; break
+                    if ltf_candle['high'] >= active_trade['sl_price']: active_trade['status'] = 'closed_sl_be' if active_trade['stop_moved_to_be'] else 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']; break
                     elif ltf_candle['low'] <= active_trade['tp_price']: active_trade['status'] = 'closed_tp'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['tp_price']
         
         if active_trade['status'] == 'open': 
@@ -208,4 +254,4 @@ def run_backtest(
             print(f"    Trade EOD Close: ID {active_trade['id']} at {active_trade['exit_time']} Price: {active_trade['exit_price']:.5f}")
 
     print(f"--- Backtest for {symbol} ({strategy_name}) Finished. Total trades: {len(trades_log)} ---")
-    return trades_log, current_overall_trade_id
+    return trades_log, current_overall_trade_id 

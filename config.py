@@ -55,12 +55,12 @@ COMMISSION_PER_TRADE = 0
 SLIPPAGE_POINTS = 0    
 RISK_PER_TRADE_PERCENT = 1.0 
 SL_BUFFER_PIPS = 2 
-TP_RR_RATIO = 1.0  # <<< ADD THIS DEFAULT GLOBAL VALUE
+TP_RR_RATIO = 3.5  # <<< ADD THIS DEFAULT GLOBAL VALUE
 
 PIP_SIZE = {
     "EURUSD": 0.0001, "GBPUSD": 0.0001, "AUDUSD": 0.0001, "NZDUSD": 0.0001,
     "USDCAD": 0.0001, "USDCHF": 0.0001, "USDJPY": 0.01,
-    "EURJPY": 0.01, "GBPJPY": 0.01, "AUDJPY": 0.01, "XAUUSD": 0.01
+    "EURJPY": 0.01, "GBPJPY": 0.01, "AUDJPY": 0.01, "XAUUSD": 0.1
 }
 LOG_LEVEL = "INFO" 
 
@@ -76,7 +76,7 @@ STRATEGY_SPECIFIC_PARAMS = {
         "SMA_PERIOD": 9,
         "SL_FIXED_PIPS": 10,
         "SL_HA_SWING_CANDLES": 5, # Number of HA candles before entry to check for swing high/low
-        "TP_RR_RATIO": 2.0,       # Example: default to 1:2 R:R for this strategy
+        "TP_RR_RATIO": 3.5,       # Example: default to 1:2 R:R for this strategy
         "HTF_BREAK_TYPE": "close", # CHoCH break type on HTF
         "R_LEVELS_TO_TRACK": [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0] # Track more R-levels
     },

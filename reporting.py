@@ -19,71 +19,100 @@ def calculate_performance_metrics(trades_log: list,
                                   pip_size: float,
                                   strategy_params_used: dict, 
                                   session_results_path: str):
+    """
+    Calculates and prints key performance metrics from a list of trades for a single symbol.
+    Saves the equity curve plot to the specified session path.
+    Returns the report as a string.
+    """
     if not trades_log:
         report_text = f"No trades to report for {symbol}.\n"
         print(report_text)
         return report_text 
 
     df_trades = pd.DataFrame(trades_log)
+
+    # Ensure numeric types and handle potential NaNs
     df_trades['pnl_pips'] = pd.to_numeric(df_trades['pnl_pips'], errors='coerce')
     df_trades['pnl_R'] = pd.to_numeric(df_trades['pnl_R'], errors='coerce').fillna(0) 
-    # Use the new field name for analysis
     df_trades['max_R_achieved_for_analysis'] = pd.to_numeric(df_trades.get('max_R_achieved_for_analysis'), errors='coerce').fillna(0)
     
     total_trades = len(df_trades)
-    winning_trades = df_trades[df_trades['pnl_R'] > 0] 
-    losing_trades = df_trades[df_trades['pnl_R'] < 0]  
-    breakeven_trades = df_trades[df_trades['pnl_R'] == 0]
+    
+    # Categorize trades
+    winning_trades = df_trades[df_trades['pnl_R'] > 0.01] # Wins if R > 0.01 (to exclude tiny positives from BE)
+    losing_trades_strict = df_trades[df_trades['pnl_R'] < -0.01] # Losses if R < -0.01
+    
+    # Breakeven trades: status is 'closed_sl_be' AND pnl_R is close to 0
+    # Or any trade where pnl_R is very close to 0, regardless of status (e.g. EOD close at entry)
+    breakeven_trades = df_trades[
+        ((df_trades['status'] == 'closed_sl_be') & (abs(df_trades['pnl_R']) <= 0.01)) |
+        ((df_trades['status'] != 'closed_sl_be') & (abs(df_trades['pnl_R']) <= 0.01))
+    ]
+    # Ensure trades counted as BE are not also counted as strict wins/losses
+    winning_trades = winning_trades[~winning_trades.index.isin(breakeven_trades.index)]
+    losing_trades_strict = losing_trades_strict[~losing_trades_strict.index.isin(breakeven_trades.index)]
+
     num_wins = len(winning_trades)
-    num_losses = len(losing_trades)
+    num_losses = len(losing_trades_strict) # Use strict losses for loss count
     num_be = len(breakeven_trades)
+    num_sl_be_hits = len(df_trades[df_trades['status'] == 'closed_sl_be']) # Count all BE SL hits
+
     win_rate = (num_wins / total_trades) * 100 if total_trades > 0 else 0
-    loss_rate = (num_losses / total_trades) * 100 if total_trades > 0 else 0
+    loss_rate = (num_losses / total_trades) * 100 if total_trades > 0 else 0 # Based on strict losses
+
     avg_win_r = winning_trades['pnl_R'].mean() if num_wins > 0 else 0
-    avg_loss_r = losing_trades['pnl_R'].mean() if num_losses > 0 else 0 
+    avg_loss_r = losing_trades_strict['pnl_R'].mean() if num_losses > 0 else 0 # Use strict losses for avg loss
+
     expectancy_r = 0
     if total_trades > 0:
+        # Expectancy considers all outcomes, including breakevens (which have pnl_R ~ 0)
+        # So, use win_rate (for wins) and loss_rate (for strict losses). BE trades contribute ~0 to expectancy.
         expectancy_r = ( (win_rate / 100) * avg_win_r ) + \
                        ( (loss_rate / 100) * avg_loss_r ) 
+    
     total_r_won = winning_trades['pnl_R'].sum()
-    total_r_lost = abs(losing_trades['pnl_R'].sum())
+    total_r_lost = abs(losing_trades_strict['pnl_R'].sum()) # Sum of strict losses
     profit_factor = total_r_won / total_r_lost if total_r_lost > 0 else np.inf if total_r_won > 0 else 1.0
+
     df_trades['cumulative_R'] = df_trades['pnl_R'].cumsum()
+    
     peak_r = df_trades['cumulative_R'].expanding(min_periods=1).max()
     drawdown_r_series = peak_r - df_trades['cumulative_R']
     max_drawdown_r = drawdown_r_series.max() if not drawdown_r_series.empty else 0.0
     
-    # Use the new field for these stats
     avg_max_r_analysis = df_trades['max_R_achieved_for_analysis'].mean() if not df_trades['max_R_achieved_for_analysis'].empty else 0.0
     median_max_r_analysis = df_trades['max_R_achieved_for_analysis'].median() if not df_trades['max_R_achieved_for_analysis'].empty else 0.0
 
     tp_rr_ratio_for_report = strategy_params_used.get("TP_RR_RATIO", "N/A (Not in params)")
     df_trades['entry_time'] = pd.to_datetime(df_trades['entry_time'])
-    df_trades['exit_time'] = pd.to_datetime(df_trades['exit_time'])
-    period_start_str = df_trades['entry_time'].min().strftime('%Y-%m-%d %H:%M') if not df_trades.empty else "N/A"
-    period_end_str = df_trades['exit_time'].max().strftime('%Y-%m-%d %H:%M') if not df_trades.empty else "N/A"
+    # Ensure exit_time exists and handle NaT for trades that might not have exited (though all should have a status)
+    df_trades['exit_time'] = pd.to_datetime(df_trades['exit_time'], errors='coerce') 
+    
+    period_start_str = df_trades['entry_time'].min().strftime('%Y-%m-%d %H:%M') if not df_trades.empty and df_trades['entry_time'].notna().any() else "N/A"
+    period_end_str = df_trades['exit_time'].max().strftime('%Y-%m-%d %H:%M') if not df_trades.empty and df_trades['exit_time'].notna().any() else "N/A"
+
     report_lines = [
         f"--------------------------------------------------",
         f"Backtest Performance Report for: {symbol}",
         f"Period: {period_start_str} to {period_end_str}",
         f"Target R:R Ratio (TP): 1:{tp_rr_ratio_for_report}",
         f"--------------------------------------------------",
-        f"Total Trades:         {total_trades}",
-        f"Winning Trades:       {num_wins} ({win_rate:.2f}%)",
-        f"Losing Trades:        {num_losses} ({loss_rate:.2f}%)",
-        f"Breakeven Trades:     {num_be}",
+        f"Total Trades:              {total_trades}",
+        f"Winning Trades (>0.01R):   {num_wins} ({win_rate:.2f}%)",
+        f"Losing Trades (<-0.01R):   {num_losses} ({loss_rate:.2f}%)",
+        f"Breakeven Trades (at BE SL): {num_sl_be_hits}",
+        f"Other Breakeven (~0R):   {num_be - num_sl_be_hits if num_be >= num_sl_be_hits else num_be}", # BE not from SL_BE status
         f"--------------------------------------------------",
-        f"Average Win (R):      {avg_win_r:.2f} R",
-        f"Average Loss (R):     {avg_loss_r:.2f} R ",
-        f"Expectancy (R):       {expectancy_r:.2f} R per trade",
-        f"Profit Factor:        {profit_factor:.2f}",
+        f"Average Win (R):           {avg_win_r:.2f} R",
+        f"Average Loss (R):          {avg_loss_r:.2f} R ",
+        f"Expectancy (R):            {expectancy_r:.2f} R per trade",
+        f"Profit Factor:             {profit_factor:.2f}",
         f"--------------------------------------------------",
-        f"Total R Won:          {total_r_won:.2f} R",
-        f"Total R Lost:         {total_r_lost:.2f} R",
-        f"Net Profit (R):       {df_trades['cumulative_R'].iloc[-1] if not df_trades.empty else 0.0:.2f} R",
+        f"Total R Won:               {total_r_won:.2f} R",
+        f"Total R Lost:              {total_r_lost:.2f} R",
+        f"Net Profit (R):            {df_trades['cumulative_R'].iloc[-1] if not df_trades.empty else 0.0:.2f} R",
         f"--------------------------------------------------",
-        f"Max Drawdown (R):     {max_drawdown_r:.2f} R",
-        # Updated report lines
+        f"Max Drawdown (R):          {max_drawdown_r:.2f} R",
         f"Avg Max R Achieved (Analysis):   {avg_max_r_analysis:.2f} R (capped at 5R)",
         f"Median Max R Achieved (Analysis):{median_max_r_analysis:.2f} R (capped at 5R)",
         f"--------------------------------------------------",
@@ -95,18 +124,20 @@ def calculate_performance_metrics(trades_log: list,
 
     for r_val in all_r_levels_for_report:
         if r_val > 5.0: continue 
-        col_name = f'{r_val}R_achieved'
+        col_name = f'{r_val:.1f}R_achieved' # Ensure consistent naming with .1f for float keys
         count = df_trades[col_name].sum() if col_name in df_trades.columns else 0
         percentage = (count / total_trades) * 100 if total_trades > 0 else 0
-        report_lines.append(f"    {r_val:.1f}R Achieved:       {count} trades ({percentage:.2f}%)")
+        report_lines.append(f"    {r_val:.1f}R Achieved:            {count} trades ({percentage:.2f}%)")
     report_lines.append(f"--------------------------------------------------")
     
     report_text = "\n".join(report_lines)
     print(report_text) 
+    
     if not df_trades.empty:
         plot_dir = os.path.join(session_results_path, "EquityCurves") 
         os.makedirs(plot_dir, exist_ok=True)
         equity_curve_path = os.path.join(plot_dir, f"{symbol}_equity_curve_R.png")
+        
         plt.figure(figsize=(12, 6))
         plt.plot(df_trades.index, df_trades['cumulative_R'], label=f'Equity Curve (R) for {symbol}')
         plt.title(f'Cumulative R Profit Over Trades - {symbol}')
@@ -117,7 +148,8 @@ def calculate_performance_metrics(trades_log: list,
             print(f"Equity curve saved to {equity_curve_path}")
         except Exception as e: print(f"Error saving equity curve plot for {symbol}: {e}")
         plt.close()
-    return report_text 
+
+    return report_text
 
 def calculate_portfolio_performance_metrics(all_symbols_trades_logs: dict, 
                                             initial_capital: float, 

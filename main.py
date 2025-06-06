@@ -7,28 +7,20 @@ import config
 from data_handler import fetch_historical_data, shutdown_mt5_connection, initialize_mt5_connection
 from heikin_ashi import calculate_heikin_ashi
 from utils import identify_swing_points_simple, identify_swing_points_zigzag
-from plotting_utils import plot_ohlc_with_swings # Keep for debug_plot mode
+from plotting_utils import plot_ohlc_with_swings 
 from backtester import run_backtest, get_pip_size 
 from reporting import calculate_performance_metrics, calculate_portfolio_performance_metrics
-from strategies import get_strategy_class # For debug_plot if refactored
-from plotly_plotting import plot_trade_chart_plotly # New import
+from strategies import get_strategy_class 
+from plotly_plotting import plot_trade_chart_plotly 
 from datetime import datetime as dt
 
 def debug_strategy_on_segment(symbol: str, start_date: str, end_date: str, 
                               strategy_name_to_debug: str, strategy_params_to_debug: dict,
                               plot_output_dir: str = "plots"):
-    """
-    Debugs a specific strategy by plotting its signals.
-    NOTE: This function would need significant refactoring to use the strategy object's methods
-    for signal detection if you want it to reflect the new architecture accurately.
-    For now, it might still rely on the older direct calls to strategy_logic.py functions
-    if those are kept for direct invocation. Or, it needs to instantiate the strategy.
-    """
     print(f"--- Debugging Strategy {strategy_name_to_debug} for {symbol} from {start_date} to {end_date} ---")
     print("NOTE: debug_strategy_on_segment needs refactoring to use the new strategy object model for accurate signal plotting.")
     
-    # --- Fallback to old plotting logic for demonstration (needs update) ---
-    from strategy_logic import detect_choch, detect_ltf_structure_change # Temporary direct import for old debug
+    from strategy_logic import detect_choch, detect_ltf_structure_change 
     os.makedirs(plot_output_dir, exist_ok=True) 
     print(f"\nFetching HTF ({config.HTF_TIMEFRAME_STR}) data...")
     htf_data = fetch_historical_data(symbol, config.HTF_MT5, start_date, end_date)
@@ -83,8 +75,15 @@ if __name__ == "__main__":
 
     try:
         if args.mode == "debug_plot":
-            print("Debug plot mode needs refactoring to use the new plotting and strategy object structure for accurate signal display.")
-            pass
+            # This debug_plot mode needs to be updated to use the strategy object model
+            # for accurate signal plotting if you rely on it heavily.
+            debug_symbol = args.symbols[0] if args.symbols else config.SYMBOLS[0]
+            debug_start_date = "2025-02-03" # Example fixed date for focused debug
+            debug_end_date = "2025-02-07"   # Example fixed date
+            print(f"Running in debug_plot mode for {debug_symbol} from {debug_start_date} to {debug_end_date}")
+            debug_strategy_on_segment(debug_symbol, debug_start_date, debug_end_date, 
+                                      active_strategy_name, strategy_custom_params, 
+                                      session_results_path) # Pass session_results_path
 
         elif args.mode == "backtest":
             for symbol_to_run in args.symbols:
@@ -114,15 +113,38 @@ if __name__ == "__main__":
 
                 if logged_trades_for_symbol:
                     pip_size_val = get_pip_size(symbol_to_run)
-                    for trade in logged_trades_for_symbol: 
-                        if trade.get('exit_price') is not None and trade.get('entry_price') is not None and \
-                           trade.get('sl_price') is not None and trade.get('pnl_R') is None: 
-                            risk_pips = abs(trade['entry_price'] - trade['sl_price']) / pip_size_val
+                    print(f"  DEBUG: Calculating PnL R for {len(logged_trades_for_symbol)} trades for {symbol_to_run}") # Moved print
+                    for trade_idx, trade in enumerate(logged_trades_for_symbol): 
+                        if trade.get('exit_price') is not None and \
+                           trade.get('entry_price') is not None and \
+                           trade.get('initial_sl_price') is not None: # Check for initial_sl_price
+                            
+                            initial_sl = trade['initial_sl_price'] # Use the stored initial SL
+                            risk_pips = abs(trade['entry_price'] - initial_sl) / pip_size_val
+                            
                             pnl_pips_val = 0
-                            if trade['direction'] == 'bullish': pnl_pips_val = (trade['exit_price'] - trade['entry_price']) / pip_size_val
-                            elif trade['direction'] == 'bearish': pnl_pips_val = (trade['entry_price'] - trade['exit_price']) / pip_size_val
-                            if risk_pips > 1e-9: trade['pnl_R'] = round(pnl_pips_val / risk_pips, 2)
-                            else: trade['pnl_R'] = 0 
+                            if trade['direction'] == 'bullish': 
+                                pnl_pips_val = (trade['exit_price'] - trade['entry_price']) / pip_size_val
+                            elif trade['direction'] == 'bearish': 
+                                pnl_pips_val = (trade['entry_price'] - trade['exit_price']) / pip_size_val
+                            
+                            if risk_pips > 1e-9: 
+                                trade['pnl_R'] = round(pnl_pips_val / risk_pips, 2)
+                            else: 
+                                trade['pnl_R'] = 0 
+                            
+                            # <<< DEBUG PRINT FOR TP TRADES >>>
+                            if trade['status'] == 'closed_tp':
+                                print(f"    DEBUG_TRADE_PNL_R (TP): ID {trade['id']}, Entry {trade['entry_price']:.5f}, Exit {trade['exit_price']:.5f}, Initial_SL {initial_sl:.5f}, RiskPips {risk_pips:.2f}, PnLPips {pnl_pips_val:.2f}, PnL_R {trade['pnl_R']:.2f}, Target_RR {strategy_custom_params.get('TP_RR_RATIO', 'N/A')}")
+                            elif trade['status'] == 'closed_sl_be':
+                                print(f"    DEBUG_TRADE_PNL_R (SL@BE): ID {trade['id']}, Entry {trade['entry_price']:.5f}, Exit {trade['exit_price']:.5f}, Initial_SL {initial_sl:.5f}, RiskPips {risk_pips:.2f}, PnLPips {pnl_pips_val:.2f}, PnL_R {trade['pnl_R']:.2f}")
+                            elif trade['status'] == 'closed_sl':
+                                print(f"    DEBUG_TRADE_PNL_R (SL): ID {trade['id']}, Entry {trade['entry_price']:.5f}, Exit {trade['exit_price']:.5f}, Initial_SL {initial_sl:.5f}, RiskPips {risk_pips:.2f}, PnLPips {pnl_pips_val:.2f}, PnL_R {trade['pnl_R']:.2f}")
+
+
+                        else: 
+                             trade['pnl_R'] = 0 
+                             print(f"    DEBUG_TRADE_PNL_R: ID {trade.get('id','N/A')} missing price data for PnL R calc.")
                     
                     report_text_single = calculate_performance_metrics(
                         logged_trades_for_symbol, config.INITIAL_CAPITAL, symbol_to_run, 
@@ -132,8 +154,6 @@ if __name__ == "__main__":
                 else:
                     all_reports_text.append(f"\nNo trades for {symbol_to_run} with {active_strategy_name}.\n")
             
-            # Check if any trades were logged across all symbols before generating portfolio report
-            # The check needs to see if any list within the dictionary is non-empty
             if any(trade_list for trade_list in all_symbols_trades_dict.values()):
                 print(f"\n\n===== Generating Portfolio Performance Report ({active_strategy_name}) =====")
                 portfolio_report_text = calculate_portfolio_performance_metrics(
