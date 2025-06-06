@@ -64,20 +64,22 @@ PIP_SIZE = {
 }
 LOG_LEVEL = "INFO" 
 
-ACTIVE_STRATEGY_NAME = "ChochHa"  
+ACTIVE_STRATEGY_NAME = "ChochHaSma"  
 
 STRATEGY_SPECIFIC_PARAMS = {
     "ChochHa": {
         "BREAK_TYPE": "close", 
-        "TP_RR_RATIO": 1,
-        "R_LEVELS_TO_TRACK": [1.0, 1.1, 1.2, 1.25, 1.3, 1.5, 2.0, 2.5, 3.0]
+        "TP_RR_RATIO": 1.5,
+        "R_LEVELS_TO_TRACK": [1.0, 1.5, 2.0, 2.5, 3.0] 
     },
-    "MACrossover": { 
-        "FAST_MA_PERIOD": 10,
-        "SLOW_MA_PERIOD": 30,
-        "TP_RR_RATIO": 2.0,
-        "R_LEVELS_TO_TRACK": [1.0, 2.0]
-    }
+    "ChochHaSma": { # Parameters for the new strategy
+        "SMA_PERIOD": 9,
+        "SL_FIXED_PIPS": 10,
+        "SL_HA_SWING_CANDLES": 5, # Number of HA candles before entry to check for swing high/low
+        "TP_RR_RATIO": 2.0,       # Example: default to 1:2 R:R for this strategy
+        "HTF_BREAK_TYPE": "close", # CHoCH break type on HTF
+        "R_LEVELS_TO_TRACK": [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0] # Track more R-levels
+    },
 }
 
 if HTF_MT5 is None: raise ValueError(f"Invalid HTF_TIMEFRAME_STR: {HTF_TIMEFRAME_STR}")
