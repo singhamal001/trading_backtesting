@@ -1,0 +1,2704 @@
+### File: X:\AmalTrading\trading_backtesting\backtester.py
+
+# forex_backtester_cli/backtester.py
+import pandas as pd
+from datetime import timedelta 
+
+import config
+from strategies import get_strategy_class 
+from plotly_plotting import plot_trade_chart_plotly 
+
+def get_pip_size(symbol: str) -> float:
+    for key_part in config.PIP_SIZE:
+        if key_part in symbol.upper():
+            return config.PIP_SIZE[key_part]
+    if "JPY" in symbol.upper(): return 0.01 
+    return 0.0001
+
+def is_time_allowed(timestamp_utc: pd.Timestamp) -> bool:
+    if not config.ENABLE_TIME_FILTER:
+        return True
+    time_utc = timestamp_utc.time() 
+    start_h, start_m = config.ALLOWED_TRADING_UTC_START_HOUR, config.ALLOWED_TRADING_UTC_START_MINUTE
+    end_h, end_m = config.ALLOWED_TRADING_UTC_END_HOUR, config.ALLOWED_TRADING_UTC_END_MINUTE
+    current_time_in_minutes = time_utc.hour * 60 + time_utc.minute
+    allowed_start_in_minutes = start_h * 60 + start_m
+    allowed_end_in_minutes = end_h * 60 + end_m
+    return allowed_start_in_minutes <= current_time_in_minutes <= allowed_end_in_minutes
+
+def _calculate_and_set_trade_pnl(trade: dict, pip_size_for_calc: float):
+    """Helper to calculate PnL for a closed trade."""
+    if trade.get('exit_price') is not None and \
+       trade.get('entry_price') is not None and \
+       trade.get('sl_price') is not None:
+        
+        pnl_pips_val = 0
+        if trade['direction'] == 'bullish':
+            pnl_pips_val = (trade['exit_price'] - trade['entry_price']) / pip_size_for_calc
+        elif trade['direction'] == 'bearish':
+            pnl_pips_val = (trade['entry_price'] - trade['exit_price']) / pip_size_for_calc
+        
+        trade['pnl_pips'] = round(pnl_pips_val, 2)
+        
+        risk_pips = abs(trade['entry_price'] - trade['sl_price']) / pip_size_for_calc
+        if risk_pips > 1e-9: # Avoid division by zero or tiny risk
+            trade['pnl_R'] = round(pnl_pips_val / risk_pips, 2)
+        else:
+            trade['pnl_R'] = 0.0 # Or handle as error/invalid trade
+            print(f"    Warning: Trade ID {trade.get('id')} had zero or tiny risk. PnL R set to 0.")
+    else:
+        print(f"    DEBUG_TRADE_PNL_R: Trade ID {trade.get('id')} missing price data for PnL R calc during closure.")
+        trade['pnl_pips'] = 0.0
+        trade['pnl_R'] = 0.0
+
+
+def run_backtest(
+    symbol: str,
+    htf_data_with_swings: pd.DataFrame, 
+    ltf_data_original_ohlc: pd.DataFrame, 
+    ltf_data_ha_with_swings: pd.DataFrame,
+    strategy_name: str, 
+    strategy_custom_params: dict,
+    session_results_path: str,
+    starting_trade_id: int 
+    ):
+    print(f"\n--- Starting Backtest for {symbol} using Strategy: {strategy_name} (Global Start ID: {starting_trade_id}) ---")
+    trades_log = []
+    active_trade = None
+    pip_size_local = get_pip_size(symbol) # Use local variable for pip_size
+    sl_buffer_price = config.SL_BUFFER_PIPS * pip_size_local
+    current_overall_trade_id = starting_trade_id -1 
+
+    StrategyClass = get_strategy_class(strategy_name)
+    if not StrategyClass:
+        print(f"ERROR: Strategy '{strategy_name}' not found.")
+        return [], starting_trade_id -1 
+    
+    common_strategy_params = {
+        "symbol": symbol, "pip_size": pip_size_local, "sl_buffer_price": sl_buffer_price,
+        "htf_timeframe_str": config.HTF_TIMEFRAME_STR, "ltf_timeframe_str": config.LTF_TIMEFRAME_STR,
+    }
+    strategy_instance = StrategyClass(strategy_custom_params, common_strategy_params)
+    
+    htf_arg_for_prepare = htf_data_with_swings.copy()
+    ltf_arg_for_prepare = ltf_data_original_ohlc.copy() 
+    if strategy_name == "ChochHa": 
+        ltf_arg_for_prepare = ltf_data_ha_with_swings.copy()
+
+    prepared_htf_data, prepared_ltf_data_from_strategy = strategy_instance.prepare_data(
+        htf_arg_for_prepare, ltf_arg_for_prepare   
+    )
+    
+    start_offset_htf = (config.ZIGZAG_LEN_HTF if config.SWING_IDENTIFICATION_METHOD == "zigzag" 
+                        else config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF) + 10
+
+    for i in range(start_offset_htf, len(prepared_htf_data)):
+        current_htf_candle_time = prepared_htf_data.index[i]
+        manage_trade_until_time = prepared_htf_data.index[i+1] if i + 1 < len(prepared_htf_data) else ltf_data_original_ohlc.index[-1]
+
+        if active_trade:
+            ltf_management_slice = ltf_data_original_ohlc[
+                (ltf_data_original_ohlc.index > active_trade['last_checked_ltf_time']) &
+                (ltf_data_original_ohlc.index <= manage_trade_until_time)
+            ]
+            for ltf_idx, ltf_candle in ltf_management_slice.iterrows():
+                active_trade['last_checked_ltf_time'] = ltf_idx
+                if active_trade.get('max_R_achieved_for_analysis', 0.0) < 5.0 or active_trade['status'] == 'open':
+                    risk_in_price = abs(active_trade['entry_price'] - active_trade['sl_price'])
+                    if risk_in_price > 1e-9: # Ensure risk_in_price is valid
+                        current_potential_R = 0.0
+                        if active_trade['direction'] == 'bullish': current_potential_R = (ltf_candle['high'] - active_trade['entry_price']) / risk_in_price
+                        elif active_trade['direction'] == 'bearish': current_potential_R = (active_trade['entry_price'] - ltf_candle['low']) / risk_in_price
+                        active_trade['max_R_achieved_for_analysis'] = max(active_trade.get('max_R_achieved_for_analysis', 0.0), min(current_potential_R, 5.0))
+                        r_levels_to_check_for_analysis = strategy_instance.get_r_levels_to_track() + [3.5, 4.0, 4.5, 5.0]
+                        r_levels_to_check_for_analysis = sorted(list(set(r_levels_to_check_for_analysis)))
+                        for r_target in r_levels_to_check_for_analysis:
+                            if r_target > 5.0: continue 
+                            if not active_trade.get(f'{r_target}R_achieved', False) and current_potential_R >= r_target:
+                                active_trade[f'{r_target}R_achieved'] = True
+                
+                if active_trade['status'] == 'open': 
+                    if active_trade['direction'] == 'bullish':
+                        if ltf_candle['low'] <= active_trade['sl_price']: 
+                            active_trade['status'] = 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']
+                            _calculate_and_set_trade_pnl(active_trade, pip_size_local) # Calculate PNL
+                            print(f"    Trade SL: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['sl_price']:.5f}"); break 
+                        elif ltf_candle['high'] >= active_trade['tp_price']: 
+                            active_trade['status'] = 'closed_tp'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['tp_price']
+                            _calculate_and_set_trade_pnl(active_trade, pip_size_local) # Calculate PNL
+                            for r_target in strategy_instance.get_r_levels_to_track():
+                                if r_target <= strategy_instance.tp_rr_ratio: active_trade[f'{r_target}R_achieved'] = True
+                            active_trade['max_R_achieved_for_analysis'] = max(active_trade.get('max_R_achieved_for_analysis', 0.0), min(strategy_instance.tp_rr_ratio, 5.0))
+                            print(f"    Trade TP: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['tp_price']:.5f}")
+                            # No break for TP, R-analysis continues on this candle, status is now closed_tp
+                    elif active_trade['direction'] == 'bearish':
+                        if ltf_candle['high'] >= active_trade['sl_price']: 
+                            active_trade['status'] = 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']
+                            _calculate_and_set_trade_pnl(active_trade, pip_size_local) # Calculate PNL
+                            print(f"    Trade SL: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['sl_price']:.5f}"); break
+                        elif ltf_candle['low'] <= active_trade['tp_price']: 
+                            active_trade['status'] = 'closed_tp'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['tp_price']
+                            _calculate_and_set_trade_pnl(active_trade, pip_size_local) # Calculate PNL
+                            for r_target in strategy_instance.get_r_levels_to_track():
+                                 if r_target <= strategy_instance.tp_rr_ratio: active_trade[f'{r_target}R_achieved'] = True
+                            active_trade['max_R_achieved_for_analysis'] = max(active_trade.get('max_R_achieved_for_analysis', 0.0), min(strategy_instance.tp_rr_ratio, 5.0))
+                            print(f"    Trade TP: ID {active_trade['id']} at {ltf_idx} Price: {active_trade['tp_price']:.5f}")
+            
+            if active_trade['status'] != 'open': active_trade = None
+        
+        if not active_trade:
+            htf_signal = strategy_instance.check_htf_condition(prepared_htf_data, i)
+            if htf_signal:
+                level_broken_val = htf_signal.get('level_broken')
+                level_broken_str = f"{level_broken_val:.5f}" if isinstance(level_broken_val, (int, float)) else str(level_broken_val if level_broken_val is not None else 'N/A')
+                print(f"\n{current_htf_candle_time}: HTF Signal ({htf_signal.get('type','UnknownType')}) detected for {strategy_name}. Level: {level_broken_str}")
+                
+                ltf_search_start_time = current_htf_candle_time 
+                ltf_search_window_end_time = current_htf_candle_time + (config.HTF_TIMEDELTA * 3) 
+                relevant_ltf_segment_for_signal = prepared_ltf_data_from_strategy[
+                    (prepared_ltf_data_from_strategy.index > ltf_search_start_time) & 
+                    (prepared_ltf_data_from_strategy.index <= ltf_search_window_end_time)
+                ]
+                if relevant_ltf_segment_for_signal.empty: continue
+
+                for j_ltf_search in range(len(relevant_ltf_segment_for_signal)):
+                    current_ltf_processed_candle_time = relevant_ltf_segment_for_signal.index[j_ltf_search]
+                    if not is_time_allowed(current_ltf_processed_candle_time): continue
+
+                    original_ltf_iloc = prepared_ltf_data_from_strategy.index.get_loc(current_ltf_processed_candle_time)
+                    ltf_entry_signal = strategy_instance.check_ltf_entry_signal(
+                        prepared_ltf_data_from_strategy, original_ltf_iloc, htf_signal
+                    )
+
+                    if ltf_entry_signal:
+                        entry_candle_iloc_in_subset = j_ltf_search + 1 
+                        if entry_candle_iloc_in_subset < len(relevant_ltf_segment_for_signal):
+                            entry_time = relevant_ltf_segment_for_signal.index[entry_candle_iloc_in_subset]
+                            if entry_time not in ltf_data_original_ohlc.index: continue
+                            entry_price = ltf_data_original_ohlc.loc[entry_time]['open']
+                            
+                            sl_price, tp_price = strategy_instance.calculate_sl_tp(
+                                entry_price, entry_time, prepared_ltf_data_from_strategy, 
+                                ltf_entry_signal, htf_signal
+                            )
+                            if sl_price is None or tp_price is None: break 
+
+                            current_overall_trade_id += 1 
+                            print(f"    {entry_time}: LTF ENTRY SIGNAL ({strategy_name})! Type: {ltf_entry_signal['type']}, Price: {entry_price:.5f}")
+                            active_trade = {
+                                "id": current_overall_trade_id, "symbol_specific_id": len(trades_log) + 1, 
+                                "symbol": symbol, "strategy": strategy_name,
+                                "entry_time": entry_time, "entry_price": entry_price,
+                                "direction": ltf_entry_signal["direction"], 
+                                "sl_price": sl_price, "tp_price": tp_price,
+                                "htf_signal_details": htf_signal, "ltf_signal_details": ltf_entry_signal,
+                                "status": "open", "exit_time": None, "exit_price": None,
+                                "pnl_pips": 0.0, "pnl_R": 0.0, # Initialize with 0.0
+                                "last_checked_ltf_time": entry_time, 'max_R_achieved_for_analysis': 0.0 
+                            }
+                            r_levels_to_init = strategy_instance.get_r_levels_to_track() + [3.5, 4.0, 4.5, 5.0]
+                            for r_val in sorted(list(set(r_levels_to_init))):
+                                if r_val <= 5.0: active_trade[f'{r_val}R_achieved'] = False
+                            
+                            trades_log.append(active_trade)
+                            print(f"    Trade Opened: ID {active_trade['id']} ({active_trade['symbol_specific_id']}-{symbol}) {active_trade['direction']} at {active_trade['entry_price']:.5f}, SL: {active_trade['sl_price']:.5f}, TP: {active_trade['tp_price']:.5f}")
+                            
+                            active_trade['overall_trade_id'] = active_trade['id'] 
+                            plot_trade_chart_plotly(active_trade, session_results_path) 
+                            break 
+    
+    if active_trade and active_trade['status'] == 'open':
+        print(f"    Managing EOD for still open trade ID {active_trade['id']} from {active_trade['last_checked_ltf_time']}")
+        ltf_final_slice = ltf_data_original_ohlc[ltf_data_original_ohlc.index > active_trade['last_checked_ltf_time']]
+        for ltf_idx, ltf_candle in ltf_final_slice.iterrows(): 
+            active_trade['last_checked_ltf_time'] = ltf_idx
+            if active_trade.get('max_R_achieved_for_analysis', 0.0) < 5.0 or active_trade['status'] == 'open':
+                risk_in_price = abs(active_trade['entry_price'] - active_trade['sl_price'])
+                if risk_in_price > 1e-9:
+                    current_potential_R = 0.0
+                    if active_trade['direction'] == 'bullish': current_potential_R = (ltf_candle['high'] - active_trade['entry_price']) / risk_in_price
+                    elif active_trade['direction'] == 'bearish': current_potential_R = (active_trade['entry_price'] - ltf_candle['low']) / risk_in_price
+                    active_trade['max_R_achieved_for_analysis'] = max(active_trade.get('max_R_achieved_for_analysis', 0.0), min(current_potential_R, 5.0))
+                    r_levels_to_check_for_analysis = strategy_instance.get_r_levels_to_track() + [3.5, 4.0, 4.5, 5.0]
+                    for r_target in sorted(list(set(r_levels_to_check_for_analysis))):
+                        if r_target <= 5.0 and not active_trade.get(f'{r_target}R_achieved', False) and current_potential_R >= r_target:
+                            active_trade[f'{r_target}R_achieved'] = True
+            if active_trade['status'] == 'open': 
+                if active_trade['direction'] == 'bullish': 
+                    if ltf_candle['low'] <= active_trade['sl_price']: 
+                        active_trade['status'] = 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']
+                        _calculate_and_set_trade_pnl(active_trade, pip_size_local)
+                        break 
+                    elif ltf_candle['high'] >= active_trade['tp_price']: 
+                        active_trade['status'] = 'closed_tp'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['tp_price']
+                        _calculate_and_set_trade_pnl(active_trade, pip_size_local)
+                elif active_trade['direction'] == 'bearish': 
+                    if ltf_candle['high'] >= active_trade['sl_price']: 
+                        active_trade['status'] = 'closed_sl'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['sl_price']
+                        _calculate_and_set_trade_pnl(active_trade, pip_size_local)
+                        break
+                    elif ltf_candle['low'] <= active_trade['tp_price']: 
+                        active_trade['status'] = 'closed_tp'; active_trade['exit_time'] = ltf_idx; active_trade['exit_price'] = active_trade['tp_price']
+                        _calculate_and_set_trade_pnl(active_trade, pip_size_local)
+        
+        if active_trade['status'] == 'open': 
+            active_trade['status'] = 'closed_eod'; active_trade['exit_time'] = ltf_data_original_ohlc.index[-1]; active_trade['exit_price'] = ltf_data_original_ohlc.iloc[-1]['close']
+            _calculate_and_set_trade_pnl(active_trade, pip_size_local) # Calculate PNL for EOD close
+            print(f"    Trade EOD Close: ID {active_trade['id']} at {active_trade['exit_time']} Price: {active_trade['exit_price']:.5f}")
+
+    print(f"--- Backtest for {symbol} ({strategy_name}) Finished. Total trades: {len(trades_log)} ---")
+    return trades_log, current_overall_trade_id
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\config.py
+
+# forex_backtester_cli/config.py
+import MetaTrader5 as mt5
+import pandas as pd
+
+# --- MT5 Connection Configuration ---
+MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe" 
+ACCOUNT_LOGIN = 686105
+ACCOUNT_PASSWORD = "5rG@EpLd"
+ACCOUNT_SERVER = "TenTrade-Server"
+
+# --- Timezone Configuration ---
+INTERNAL_TIMEZONE = 'UTC'
+
+# --- Default Backtest Parameters ---
+SYMBOLS = ["EURUSD", "USDJPY", "USDCHF", "USDCAD"] 
+
+HTF_TIMEFRAME_STR = "M15" 
+LTF_TIMEFRAME_STR = "M5"
+
+TIMEFRAME_MAP = {
+    "M1": mt5.TIMEFRAME_M1, "M5": mt5.TIMEFRAME_M5, "M15": mt5.TIMEFRAME_M15,
+    "M30": mt5.TIMEFRAME_M30, "H1": mt5.TIMEFRAME_H1, "H4": mt5.TIMEFRAME_H4,
+    "D1": mt5.TIMEFRAME_D1, "W1": mt5.TIMEFRAME_W1, "MN1": mt5.TIMEFRAME_MN1,
+}
+HTF_MT5 = TIMEFRAME_MAP.get(HTF_TIMEFRAME_STR)
+LTF_MT5 = TIMEFRAME_MAP.get(LTF_TIMEFRAME_STR)
+
+TIMEDELTA_MAP = {
+    "M1": pd.Timedelta(minutes=1), "M5": pd.Timedelta(minutes=5), 
+    "M15": pd.Timedelta(minutes=15), "M30": pd.Timedelta(minutes=30),
+    "H1": pd.Timedelta(hours=1), "H4": pd.Timedelta(hours=4),
+    "D1": pd.Timedelta(days=1)
+}
+HTF_TIMEDELTA = TIMEDELTA_MAP.get(HTF_TIMEFRAME_STR)
+if HTF_TIMEDELTA is None:
+    print(f"Warning: Could not determine timedelta for HTF: {HTF_TIMEFRAME_STR}. Defaulting.")
+    if HTF_TIMEFRAME_STR == "H4": HTF_TIMEDELTA = pd.Timedelta(hours=4)
+    elif HTF_TIMEFRAME_STR == "M30": HTF_TIMEDELTA = pd.Timedelta(minutes=30)
+    elif HTF_TIMEFRAME_STR == "H1": HTF_TIMEDELTA = pd.Timedelta(hours=1)
+    else: HTF_TIMEDELTA = pd.Timedelta(days=1) 
+
+START_DATE_STR = "2024-08-01" 
+END_DATE_STR = "2025-03-31"   
+
+SWING_IDENTIFICATION_METHOD = "zigzag" 
+N_BARS_LEFT_RIGHT_FOR_SWING_HTF = 5 
+N_BARS_LEFT_RIGHT_FOR_SWING_LTF = 3 
+ZIGZAG_LEN_HTF = 9 
+ZIGZAG_LEN_LTF = 5 
+
+BREAK_TYPE = "close" # Default break type, can be overridden by strategy
+
+INITIAL_CAPITAL = 10000
+COMMISSION_PER_TRADE = 0 
+SLIPPAGE_POINTS = 0    
+RISK_PER_TRADE_PERCENT = 1.0 
+SL_BUFFER_PIPS = 2 
+TP_RR_RATIO = 3.5  # <<< ADD THIS DEFAULT GLOBAL VALUE
+
+PIP_SIZE = {
+    "EURUSD": 0.0001, "GBPUSD": 0.0001, "AUDUSD": 0.0001, "NZDUSD": 0.0001,
+    "USDCAD": 0.0001, "USDCHF": 0.0001, "USDJPY": 0.015,
+    "EURJPY": 0.015, "GBPJPY": 0.015, "AUDJPY": 0.015, "XAUUSD": 0.1
+}
+LOG_LEVEL = "INFO" 
+
+ACTIVE_STRATEGY_NAME = "ZLSMAWithFilters"  
+
+STRATEGY_SPECIFIC_PARAMS = {
+    "ChochHa": {
+        "BREAK_TYPE": "close", 
+        "TP_RR_RATIO": 1.5,
+        "R_LEVELS_TO_TRACK": [1.0, 1.5, 2.0, 2.5, 3.0] 
+    },
+    "ChochHaSma": { # Parameters for the new strategy
+        "SMA_PERIOD": 9,
+        "SL_FIXED_PIPS": 10,
+        "SL_HA_SWING_CANDLES": 5, # Number of HA candles before entry to check for swing high/low
+        "TP_RR_RATIO": 2,       # Example: default to 1:2 R:R for this strategy
+        "HTF_BREAK_TYPE": "close", # CHoCH break type on HTF
+        "R_LEVELS_TO_TRACK": [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0] # Track more R-levels
+    },
+    "ZLSMAWithFilters": {
+        "ZLSMA_LENGTH": 32,
+        "ZLSMA_SOURCE": "close",
+        "TP_RR_RATIO": 2.0,
+        "SL_ATR_PERIOD": 14, # For ATR-based SL
+        "SL_ATR_MULTIPLIER": 1.5,
+        "R_LEVELS_TO_TRACK": [1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0],
+
+        "USE_RANGE_FILTER_HTF": True, # Enable/disable range filter
+        "RANGE_FILTER_LENGTH": 20,    # Parameter for range detector
+        "RANGE_FILTER_MULT": 1.0,     # Parameter for range detector (ATR multiplier)
+        "RANGE_FILTER_ATR_LEN": 100,  # ATR length for range detector (PineScript used 500, might be too long for M15)
+                                      # Using a shorter ATR for range detector on M15 might be more responsive
+
+        "USE_ADAPTIVE_MACD_FILTER": True, # Enable/disable MACD filter
+        "ADAPTIVE_MACD_R2_PERIOD": 20, # `length` in PineScript for R2 calc
+        "ADAPTIVE_MACD_FAST": 10,
+        "ADAPTIVE_MACD_SLOW": 12, # PineScript used 20, common MACD uses 12/26
+        "ADAPTIVE_MACD_SIGNAL": 9
+    },
+}
+
+if HTF_MT5 is None: raise ValueError(f"Invalid HTF_TIMEFRAME_STR: {HTF_TIMEFRAME_STR}")
+if LTF_MT5 is None: raise ValueError(f"Invalid LTF_TIMEFRAME_STR: {LTF_TIMEFRAME_STR}")
+
+# --- Trading Session Time Filter ---
+ENABLE_TIME_FILTER = True
+# Times are in UTC. 1:00 AM IST is 20:30 UTC previous day. 6:00 AM IST is 00:30 UTC current day.
+# This means we want to AVOID trading when UTC hour is 20, 21, 22, 23 (of previous day for IST)
+# AND 0 (until 00:29 UTC) of the current day.
+# Simpler: Define allowed UTC hours.
+# Example: If IST trading is 9:00 AM to 11:00 PM IST
+# 9:00 AM IST = 03:30 UTC
+# 11:00 PM IST = 17:30 UTC
+# So, allowed UTC hours might be from 3 to 17.
+
+# Let's define the NO-TRADE PERIOD in UTC
+# 1:00 AM IST = 19:30 UTC on the *previous day* if we consider a continuous timeline,
+# or more simply, for a given day:
+# 1:00 AM IST is the day's 01:00+05:30 = day's (01-05):(00-30) UTC = (day-1) 20:30 UTC
+# 6:00 AM IST is the day's 06:00+05:30 = day's (06-05):(00-30) UTC = day's 00:30 UTC
+
+# No trade from 20:30 UTC to 00:30 UTC (which spans across midnight UTC)
+# This means:
+# - Don't trade if hour is 21, 22, 23
+# - Don't trade if hour is 0 and minute < 30
+# - Don't trade if hour is 20 and minute >= 30
+
+# More direct: Define the NO TRADE UTC interval.
+# For 1:00 AM IST to 6:00 AM IST:
+# Start No-Trade (UTC): (1 - 5.5 + 24) % 24 = 19.5  => 19:30 UTC
+# End No-Trade (UTC):   (6 - 5.5 + 24) % 24 = 0.5   => 00:30 UTC
+# This interval crosses midnight UTC.
+# So, no trade if (time.hour > 19 or (time.hour == 19 and time.minute >=30)) OR
+#                 (time.hour == 0 and time.minute < 30)
+
+# Let's define it as a list of (start_utc_hour, start_utc_minute, end_utc_hour, end_utc_minute)
+# For simplicity, let's use whole hours for now and refine if needed.
+# 1:00 AM IST is roughly 19:30 UTC (previous day) to 20:00 UTC
+# 6:00 AM IST is roughly 00:00 UTC to 00:30 UTC
+# So, avoid UTC hours 20, 21, 22, 23, and hour 0 (until 00:30)
+# This is tricky with simple hour checks due to crossing midnight.
+
+# Alternative: Define ALLOWED trading hours in UTC.
+# If IST trading is from 6:01 AM to 00:59 AM (next day IST)
+# 6:01 AM IST = 00:31 UTC
+# 00:59 AM IST (next day) = 19:29 UTC (current day)
+# So, allowed UTC hours: 00:31 UTC to 19:29 UTC
+ALLOWED_TRADING_UTC_START_HOUR = 0 # Inclusive
+ALLOWED_TRADING_UTC_START_MINUTE = 31 # Inclusive
+ALLOWED_TRADING_UTC_END_HOUR = 19   # Inclusive
+ALLOWED_TRADING_UTC_END_MINUTE = 29 # Inclusive
+
+print("Config loaded.")
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\data_handler.py
+
+# forex_backtester_cli/data_handler.py
+
+import MetaTrader5 as mt5
+import pandas as pd
+from datetime import datetime
+import pytz # For timezone handling if needed, though MT5 gives UTC
+
+# Import MT5 connection details from config
+from config import MT5_PATH, ACCOUNT_LOGIN, ACCOUNT_PASSWORD, ACCOUNT_SERVER, INTERNAL_TIMEZONE
+
+# Global variable to track MT5 initialization
+mt5_initialized = False
+
+def initialize_mt5_connection():
+    """Initializes connection to MetaTrader 5 if not already initialized."""
+    global mt5_initialized
+    if mt5_initialized:
+        return True
+
+    print("Initializing MetaTrader 5 connection for data handler...")
+    init_args = []
+    init_kwargs = {}
+
+    if MT5_PATH:
+        init_args.append(MT5_PATH)
+    if ACCOUNT_LOGIN:
+        init_kwargs['login'] = ACCOUNT_LOGIN
+        if ACCOUNT_PASSWORD:
+            init_kwargs['password'] = ACCOUNT_PASSWORD
+        if ACCOUNT_SERVER:
+            init_kwargs['server'] = ACCOUNT_SERVER
+    
+    if not mt5.initialize(*init_args, **init_kwargs):
+        print(f"MT5 initialize() failed, error code = {mt5.last_error()}")
+        # Consider raising an exception or returning False to halt execution
+        return False
+    
+    print("MT5 connection successful.")
+    mt5_initialized = True
+    return True
+
+def shutdown_mt5_connection():
+    """Shuts down the MetaTrader 5 connection if initialized."""
+    global mt5_initialized
+    if mt5_initialized:
+        print("Shutting down MetaTrader 5 connection.")
+        mt5.shutdown()
+        mt5_initialized = False
+
+def fetch_historical_data(symbol: str, timeframe_mt5: int, start_date_str: str, end_date_str: str) -> pd.DataFrame | None:
+    """
+    Fetches historical OHLCV data from MetaTrader 5.
+    Timestamps in the returned DataFrame are UTC.
+    """
+    if not initialize_mt5_connection():
+        return None
+
+    try:
+        # Convert string dates to datetime objects
+        # MT5 expects naive datetime objects, assuming they are UTC for the query
+        utc_tz = pytz.timezone('UTC')
+        start_datetime_utc = utc_tz.localize(datetime.strptime(start_date_str, "%Y-%m-%d"))
+        end_datetime_utc = utc_tz.localize(datetime.strptime(end_date_str, "%Y-%m-%d"))
+        # Add one day to end_datetime_utc to include the full end_date_str
+        end_datetime_utc = end_datetime_utc + pd.Timedelta(days=1)
+
+
+    except ValueError as e:
+        print(f"Error parsing date strings: {e}")
+        return None
+
+    print(f"Fetching data for {symbol} on timeframe {timeframe_mt5} from {start_datetime_utc} to {end_datetime_utc} (UTC)...")
+    
+    rates = mt5.copy_rates_range(symbol, timeframe_mt5, start_datetime_utc, end_datetime_utc)
+
+    if rates is None:
+        print(f"mt5.copy_rates_range() for {symbol} returned None. Error: {mt5.last_error()}")
+        return None
+    
+    if len(rates) == 0:
+        print(f"No data returned for {symbol} in the specified range and timeframe.")
+        return pd.DataFrame() # Return empty DataFrame
+
+    df = pd.DataFrame(rates)
+    # Convert 'time' (seconds since epoch, UTC) to datetime objects and set as index
+    df['time'] = pd.to_datetime(df['time'], unit='s', utc=True) # Ensure it's UTC aware
+    df.set_index('time', inplace=True)
+    
+    # Ensure columns are lowercase for consistency
+    df.columns = [x.lower() for x in df.columns]
+    
+    # Select standard OHLCV columns if others exist (like 'spread', 'real_volume')
+    standard_cols = ['open', 'high', 'low', 'close', 'tick_volume']
+    df = df[[col for col in standard_cols if col in df.columns]]
+    df.rename(columns={'tick_volume': 'volume'}, inplace=True, errors='ignore')
+
+
+    print(f"Successfully fetched {len(df)} bars for {symbol}.")
+    return df
+
+# Example usage (can be removed or put in a test section later)
+if __name__ == '__main__':
+    from config import SYMBOLS, HTF_MT5, LTF_MT5, START_DATE_STR, END_DATE_STR
+
+    print("Testing data_handler.py...")
+    
+    if HTF_MT5 is not None:
+        htf_data = fetch_historical_data(SYMBOLS[0], HTF_MT5, START_DATE_STR, END_DATE_STR)
+        if htf_data is not None and not htf_data.empty:
+            print(f"\nHTF Data for {SYMBOLS[0]} ({HTF_MT5}):")
+            print(htf_data.head())
+            print(htf_data.tail())
+            print(f"Index Dtype: {htf_data.index.dtype}")
+        else:
+            print(f"Failed to fetch HTF data or data is empty for {SYMBOLS[0]}.")
+    else:
+        print("HTF_MT5 is not defined in config.")
+
+    if LTF_MT5 is not None:
+        ltf_data = fetch_historical_data(SYMBOLS[0], LTF_MT5, START_DATE_STR, END_DATE_STR)
+        if ltf_data is not None and not ltf_data.empty:
+            print(f"\nLTF Data for {SYMBOLS[0]} ({LTF_MT5}):")
+            print(ltf_data.head())
+            print(ltf_data.tail())
+            print(f"Index Dtype: {ltf_data.index.dtype}")
+
+        else:
+            print(f"Failed to fetch LTF data or data is empty for {SYMBOLS[0]}.")
+    else:
+        print("LTF_MT5 is not defined in config.")
+
+    shutdown_mt5_connection()
+    print("data_handler.py test finished.")
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\heikin_ashi.py
+
+# forex_backtester_cli/heikin_ashi.py
+import pandas as pd
+
+def calculate_heikin_ashi(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates Heikin Ashi candles from a DataFrame with 'open', 'high', 'low', 'close'.
+    Assumes the input DataFrame index is a DatetimeIndex.
+    """
+    if not all(col in df.columns for col in ['open', 'high', 'low', 'close']):
+        raise ValueError("Input DataFrame must contain 'open', 'high', 'low', 'close' columns.")
+
+    ha_df = pd.DataFrame(index=df.index)
+
+    ha_df['ha_close'] = (df['open'] + df['high'] + df['low'] + df['close']) / 4
+
+    # Calculate initial ha_open (can be same as regular open for the first bar)
+    ha_df['ha_open'] = df['open'] # Default for the first bar
+    for i in range(1, len(df)):
+        ha_df.loc[df.index[i], 'ha_open'] = \
+            (ha_df.loc[df.index[i-1], 'ha_open'] + ha_df.loc[df.index[i-1], 'ha_close']) / 2
+    
+    # For the very first ha_open, if we want to strictly follow the formula,
+    # we can set it to (open + close) / 2 of the first regular bar,
+    # or simply use the regular open as a common practice.
+    # Let's refine the first ha_open to be based on its own bar's open/close if it's the first record.
+    if len(df) > 0:
+         ha_df.loc[df.index[0], 'ha_open'] = (df.loc[df.index[0],'open'] + df.loc[df.index[0],'close']) / 2
+
+
+    ha_df['ha_high'] = ha_df[['ha_open', 'ha_close']].join(df['high']).max(axis=1)
+    ha_df['ha_low'] = ha_df[['ha_open', 'ha_close']].join(df['low']).min(axis=1)
+    
+    return ha_df[['ha_open', 'ha_high', 'ha_low', 'ha_close']]
+
+# Example usage (can be removed or put in a test section later)
+if __name__ == '__main__':
+    # Create a sample DataFrame
+    data = {
+        'open': [10, 11, 10.5, 11.5, 12],
+        'high': [12, 11.5, 11, 12, 12.5],
+        'low': [9.5, 10, 10, 11, 11.5],
+        'close': [11, 10.5, 11, 12, 11.8]
+    }
+    sample_df = pd.DataFrame(data, index=pd.to_datetime(['2023-01-01 00:00', 
+                                                         '2023-01-01 00:05', 
+                                                         '2023-01-01 00:10', 
+                                                         '2023-01-01 00:15', 
+                                                         '2023-01-01 00:20']))
+    print("Original OHLC Data:")
+    print(sample_df)
+    
+    ha_candles = calculate_heikin_ashi(sample_df.copy()) # Pass a copy
+    print("\nHeikin Ashi Candles:")
+    print(ha_candles)
+
+    # Test with data_handler
+    from data_handler import fetch_historical_data, shutdown_mt5_connection
+    from config import SYMBOLS, LTF_MT5, START_DATE_STR, END_DATE_STR
+    
+    if LTF_MT5 is not None:
+        print("\nTesting Heikin Ashi with fetched MT5 data...")
+        ltf_ohlc_data = fetch_historical_data(SYMBOLS[0], LTF_MT5, START_DATE_STR, "2023-01-03") # Short range
+        if ltf_ohlc_data is not None and not ltf_ohlc_data.empty:
+            ha_data_mt5 = calculate_heikin_ashi(ltf_ohlc_data.copy())
+            print(f"\nHeikin Ashi for {SYMBOLS[0]} (first 5 rows):")
+            print(ha_data_mt5.head())
+        else:
+            print(f"Could not fetch data for {SYMBOLS[0]} to test Heikin Ashi.")
+        shutdown_mt5_connection()
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\indicators.py
+
+# forex_backtester_cli/indicators.py
+import pandas as pd
+import numpy as np
+from scipy.stats import linregress # For linear regression
+
+def calculate_sma(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(window=length).mean()
+
+def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
+    if not (isinstance(high, pd.Series) and isinstance(low, pd.Series) and isinstance(close, pd.Series)):
+        raise TypeError("Inputs high, low, close must be pandas Series.")
+    if not (len(high) == len(low) == len(close)):
+        raise ValueError("Inputs high, low, close must have the same length.")
+
+    prev_close = close.shift(1)
+    tr1 = pd.Series(high - low)
+    tr2 = pd.Series(abs(high - prev_close))
+    tr3 = pd.Series(abs(low - prev_close))
+    
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1/length, adjust=False, min_periods=length).mean() # Using Wilder's smoothing (common for ATR)
+    # Alternatively, a simple moving average: atr = tr.rolling(window=length).mean()
+    return atr
+
+def calculate_linreg_value(series: pd.Series, length: int) -> pd.Series:
+    """Calculates the endpoint of a linear regression line over a rolling window."""
+    if len(series) < length:
+        return pd.Series(np.nan, index=series.index)
+    
+    linreg_values = pd.Series(np.nan, index=series.index)
+    x = np.arange(length)
+    for i in range(length - 1, len(series)):
+        y_window = series.iloc[i - length + 1 : i + 1].values
+        if np.isnan(y_window).any(): # Skip if NaN in window
+            continue
+        slope, intercept, r_value, p_value, std_err = linregress(x, y_window)
+        linreg_values.iloc[i] = slope * (length - 1) + intercept # Value at the end of the window
+    return linreg_values
+
+def calculate_zlsma(series: pd.Series, length: int) -> pd.Series:
+    lsma = calculate_linreg_value(series, length)
+    # Fill initial NaNs for lsma2 calculation to avoid all NaNs if lsma starts with NaNs
+    lsma_filled = lsma.copy()
+    if pd.isna(lsma_filled.iloc[length-1]) and length*2-1 < len(lsma_filled) : # Check if first calc value is NaN
+         # Try to fill forward a bit if possible, or use a simpler fill for short series
+        first_valid_lsma_idx = lsma_filled.first_valid_index()
+        if first_valid_lsma_idx is not None:
+            lsma_filled.fillna(method='bfill', limit=length*2, inplace=True) # Backfill a bit
+            lsma_filled.fillna(method='ffill', inplace=True) # Then ffill
+
+    lsma2 = calculate_linreg_value(lsma_filled, length)
+    
+    eq = lsma - lsma2 # Note: if lsma or lsma2 have NaNs, eq will too
+    zlsma = lsma + eq
+    return zlsma
+
+def calculate_range_filter_bands(close: pd.Series, length: int, atr_length: int, atr_mult: float, high: pd.Series, low: pd.Series):
+    """
+    Calculates if the market is in a range based on LuxAlgo's Range Detector concept.
+    Returns:
+        is_in_range (pd.Series): Boolean series, True if in range.
+        range_top (pd.Series): Top of the detected range.
+        range_bottom (pd.Series): Bottom of the detected range.
+    """
+    ma = calculate_sma(close, length)
+    atr_values = calculate_atr(high, low, close, atr_length) * atr_mult
+    
+    is_in_range = pd.Series(False, index=close.index)
+    range_top = pd.Series(np.nan, index=close.index)
+    range_bottom = pd.Series(np.nan, index=close.index)
+
+    # This is a simplified interpretation of the count logic.
+    # The original PineScript updates box coordinates dynamically.
+    # Here, we'll do a rolling check.
+    for i in range(length -1, len(close)):
+        if pd.isna(ma.iloc[i]) or pd.isna(atr_values.iloc[i]):
+            continue
+            
+        count = 0
+        for k in range(length): # Check previous 'length' bars
+            if i-k < 0: break
+            if abs(close.iloc[i-k] - ma.iloc[i]) > atr_values.iloc[i]:
+                count += 1
+        
+        if count == 0: # Condition for being in a range
+            is_in_range.iloc[i] = True
+            range_top.iloc[i] = ma.iloc[i] + atr_values.iloc[i]
+            range_bottom.iloc[i] = ma.iloc[i] - atr_values.iloc[i]
+            # Note: The PineScript has more complex logic for extending/merging range boxes.
+            # This version just flags if the *current* 'length' bar window is a range.
+            
+    return is_in_range, range_top, range_bottom
+
+
+def calculate_adaptive_macd(close: pd.Series, r2_period: int, fast_len: int, slow_len: int, signal_len: int):
+    """
+    Calculates Adaptive MACD based on LuxAlgo's concept.
+    Returns: macd_line, signal_line, histogram
+    """
+    # R2 calculation (coefficient of determination with time)
+    # Create a time index series (0, 1, 2, ...)
+    time_idx = pd.Series(np.arange(len(close)), index=close.index)
+    
+    # Rolling correlation of close with the time index
+    # Using apply for rolling correlation as pandas rolling().corr() needs two Series of same window
+    def rolling_corr_with_time(window_series):
+        if len(window_series) < r2_period: return np.nan
+        # window_time_idx = np.arange(len(window_series)) # This was causing issues
+        # For a fixed window, the time index within the window is always 0 to N-1
+        window_time_idx = np.arange(r2_period)
+        corr, _ = np.polyfit(window_time_idx, window_series.values, 1) # Slope is enough for R^2 proxy here
+        # A proper R^2 would be:
+        # slope, intercept, r_value, p_value, std_err = linregress(window_time_idx, window_series.values)
+        # return r_value**2
+        # For simplicity and to somewhat match Pine's ta.correlation(close, bar_index, length) behavior
+        # which is more like a momentum of correlation, let's use a simpler proxy or acknowledge this is hard to replicate exactly.
+        # The PineScript `ta.correlation(source, x, y)` is Pearson correlation of `source` and `x` over `y` bars.
+        # `bar_index` is a linearly increasing series.
+        # A simpler approach for r2 might be needed or accept deviation.
+        # For now, let's use a placeholder for r2 as exact replication is complex.
+        # A common way to get R^2 from linregress is r_value**2
+        if len(window_series) < 2: return np.nan # linregress needs at least 2 points
+        slope, intercept, r_value, p_value, std_err = linregress(np.arange(len(window_series)), window_series.values)
+        return r_value**2
+
+
+    r_squared_series = close.rolling(window=r2_period).apply(rolling_corr_with_time, raw=False)
+    r2_factor = 0.5 * (r_squared_series) + 0.5 # Pine: math.pow(corr, 2), here r_value**2 is already squared
+    r2_factor.fillna(0.5, inplace=True) # Fill NaNs, e.g. with neutral value
+
+    a1 = 2 / (fast_len + 1)
+    a2 = 2 / (slow_len + 1)
+
+    # K calculation
+    term1_k = (1 - a1) * (1 - a2)
+    term2_k = (1 - a1) / (1 - a2) # Ensure a2 != 1 (slow_len != 1)
+    if a2 == 1: term2_k = 1e9 # Avoid division by zero, make it large
+
+    K_series = r2_factor * term1_k + (1 - r2_factor) * term2_k
+    
+    # MACD calculation (recursive)
+    macd_line = pd.Series(np.nan, index=close.index)
+    close_diff = close.diff()
+    
+    # Initialize first few MACD values (e.g., with 0 or simple MACD)
+    # This recursive definition is tricky to vectorize perfectly.
+    # PineScript's nz(macd[1]) and nz(macd[2]) handle initial states.
+    if len(close) > 2:
+        macd_line.iloc[0] = 0.0 
+        macd_line.iloc[1] = (close_diff.iloc[1] if not pd.isna(close_diff.iloc[1]) else 0) * (a1 - a2) + \
+                            (-a2 - a1 + 2) * macd_line.iloc[0]
+        # K needs to be defined for macd[2]
+        # For simplicity, let's assume K is relatively stable for first few points or use a simple K
+        initial_K = K_series.bfill().iloc[0] if not K_series.empty else 0.5 # A fallback K
+
+        for i in range(2, len(close)):
+            cd = close_diff.iloc[i] if not pd.isna(close_diff.iloc[i]) else 0
+            m1 = macd_line.iloc[i-1] if not pd.isna(macd_line.iloc[i-1]) else 0
+            m2 = macd_line.iloc[i-2] if not pd.isna(macd_line.iloc[i-2]) else 0
+            k_val = K_series.iloc[i] if not pd.isna(K_series.iloc[i]) else initial_K
+            
+            macd_line.iloc[i] = cd * (a1 - a2) + (-a2 - a1 + 2) * m1 - k_val * m2
+    
+    signal_line = macd_line.ewm(span=signal_len, adjust=False, min_periods=signal_len).mean()
+    histogram = macd_line - signal_line
+    
+    return macd_line, signal_line, histogram
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\main.py
+
+# forex_backtester_cli/main.py
+import pandas as pd
+import argparse
+import os 
+
+import config
+from data_handler import fetch_historical_data, shutdown_mt5_connection, initialize_mt5_connection
+from heikin_ashi import calculate_heikin_ashi
+from utils import identify_swing_points_simple, identify_swing_points_zigzag
+from plotting_utils import plot_ohlc_with_swings 
+from backtester import run_backtest, get_pip_size 
+from reporting import calculate_performance_metrics, calculate_portfolio_performance_metrics
+from strategies import get_strategy_class 
+from plotly_plotting import plot_trade_chart_plotly 
+from datetime import datetime as dt
+
+def debug_strategy_on_segment(symbol: str, start_date: str, end_date: str, 
+                              strategy_name_to_debug: str, strategy_params_to_debug: dict,
+                              plot_output_dir: str = "plots"):
+    print(f"--- Debugging Strategy {strategy_name_to_debug} for {symbol} from {start_date} to {end_date} ---")
+    print("NOTE: debug_strategy_on_segment needs refactoring to use the new strategy object model for accurate signal plotting.")
+    
+    from strategy_logic import detect_choch, detect_ltf_structure_change 
+    os.makedirs(plot_output_dir, exist_ok=True) 
+    print(f"\nFetching HTF ({config.HTF_TIMEFRAME_STR}) data...")
+    htf_data = fetch_historical_data(symbol, config.HTF_MT5, start_date, end_date)
+    if htf_data is None or htf_data.empty: return
+    
+    if config.SWING_IDENTIFICATION_METHOD == "simple": htf_data_with_swings = identify_swing_points_simple(htf_data, config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF, config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF)
+    elif config.SWING_IDENTIFICATION_METHOD == "zigzag": htf_data_with_swings = identify_swing_points_zigzag(htf_data, config.ZIGZAG_LEN_HTF)
+    else: raise ValueError(f"Unknown method: {config.SWING_IDENTIFICATION_METHOD}")
+    
+    plot_ohlc_with_swings(htf_data, htf_data_with_swings, symbol, config.HTF_TIMEFRAME_STR, f"HTF Swings - {symbol}", save_path=os.path.join(plot_output_dir, f"{symbol}_HTF_swings.png"))
+    
+    htf_choch_points_for_plot = []
+    start_idx_choch = config.ZIGZAG_LEN_HTF if config.SWING_IDENTIFICATION_METHOD == "zigzag" else config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF
+    for i in range(start_idx_choch, len(htf_data_with_swings)):
+        choch_type, choch_price_broken, choch_confirmed_time = detect_choch(htf_data_with_swings, i, strategy_params_to_debug.get("BREAK_TYPE", "close"))
+        if choch_type: htf_choch_points_for_plot.append((choch_confirmed_time, choch_price_broken, choch_type))
+    plot_ohlc_with_swings(htf_data, htf_data_with_swings, symbol, config.HTF_TIMEFRAME_STR, f"HTF CHoCHs - {symbol}", choch_points=htf_choch_points_for_plot, save_path=os.path.join(plot_output_dir, f"{symbol}_HTF_chochs.png"))
+    print("\n--- Strategy Debugging with Plotting Finished (using potentially outdated direct logic) ---")
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Forex Backtester CLI")
+    parser.add_argument("--symbols", nargs='+', default=config.SYMBOLS, help="List of symbols")
+    parser.add_argument("--start", type=str, default=config.START_DATE_STR, help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end", type=str, default=config.END_DATE_STR, help="End date (YYYY-MM-DD)")
+    parser.add_argument("--mode", type=str, default="backtest", choices=["debug_plot", "backtest"])
+    parser.add_argument("--strategy", type=str, default=config.ACTIVE_STRATEGY_NAME, help="Name of the strategy to run")
+    
+    args = parser.parse_args()
+
+    active_strategy_name = args.strategy
+    strategy_custom_params = config.STRATEGY_SPECIFIC_PARAMS.get(active_strategy_name)
+    if strategy_custom_params is None:
+        print(f"ERROR: Parameters for strategy '{active_strategy_name}' not found in config.py. Exiting.")
+        exit()
+
+    timestamp_str = dt.now().strftime("%Y%m%d_%H%M%S")
+    symbols_str_for_folder = "_".join(args.symbols) if args.symbols else "_".join(config.SYMBOLS)
+    session_folder_name = f"{active_strategy_name}_{symbols_str_for_folder}_{timestamp_str}"
+    base_results_path = "Backtesting_Results"
+    session_results_path = os.path.join(base_results_path, session_folder_name)
+    os.makedirs(session_results_path, exist_ok=True)
+    print(f"Results will be saved in: {session_results_path}")
+
+    report_file_path = os.path.join(session_results_path, "ConsolidatedReport.txt")
+    all_reports_text = [] 
+
+    if not initialize_mt5_connection(): exit()
+    
+    all_symbols_trades_dict = {} 
+    overall_trade_counter = 0 
+
+    try:
+        if args.mode == "debug_plot":
+            # This debug_plot mode needs to be updated to use the strategy object model
+            # for accurate signal plotting if you rely on it heavily.
+            debug_symbol = args.symbols[0] if args.symbols else config.SYMBOLS[0]
+            debug_start_date = "2025-02-03" # Example fixed date for focused debug
+            debug_end_date = "2025-02-07"   # Example fixed date
+            print(f"Running in debug_plot mode for {debug_symbol} from {debug_start_date} to {debug_end_date}")
+            debug_strategy_on_segment(debug_symbol, debug_start_date, debug_end_date, 
+                                      active_strategy_name, strategy_custom_params, 
+                                      session_results_path) # Pass session_results_path
+
+        elif args.mode == "backtest":
+            for symbol_to_run in args.symbols:
+                print(f"\n===== Running Backtest for {symbol_to_run} with Strategy: {active_strategy_name} =====")
+                htf_data = fetch_historical_data(symbol_to_run, config.HTF_MT5, args.start, args.end)
+                if htf_data is None or htf_data.empty: all_symbols_trades_dict[symbol_to_run] = []; continue
+                if config.SWING_IDENTIFICATION_METHOD == "zigzag": htf_data_swings = identify_swing_points_zigzag(htf_data, config.ZIGZAG_LEN_HTF)
+                else: htf_data_swings = identify_swing_points_simple(htf_data, config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF, config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF)
+                
+                ltf_fetch_start = (pd.to_datetime(args.start) - config.HTF_TIMEDELTA * 10).strftime("%Y-%m-%d")
+                ltf_fetch_end = (pd.to_datetime(args.end) + config.HTF_TIMEDELTA * 10).strftime("%Y-%m-%d")
+                ltf_ohlc_data = fetch_historical_data(symbol_to_run, config.LTF_MT5, ltf_fetch_start, ltf_fetch_end)
+                if ltf_ohlc_data is None or ltf_ohlc_data.empty: all_symbols_trades_dict[symbol_to_run] = []; continue
+                ltf_ha_data = calculate_heikin_ashi(ltf_ohlc_data)
+                if config.SWING_IDENTIFICATION_METHOD == "zigzag": ltf_ha_data_swings = identify_swing_points_zigzag(ltf_ha_data, config.ZIGZAG_LEN_LTF, col_high='ha_high', col_low='ha_low')
+                else: ltf_ha_data_swings = identify_swing_points_simple(ltf_ha_data, config.N_BARS_LEFT_RIGHT_FOR_SWING_LTF, config.N_BARS_LEFT_RIGHT_FOR_SWING_LTF, col_high='ha_high', col_low='ha_low')
+
+                logged_trades_for_symbol, updated_overall_trade_counter = run_backtest(
+                    symbol_to_run, htf_data_swings, ltf_ohlc_data, ltf_ha_data_swings,
+                    active_strategy_name, strategy_custom_params,
+                    session_results_path, 
+                    starting_trade_id=overall_trade_counter + 1 
+                )
+                overall_trade_counter = updated_overall_trade_counter 
+                
+                all_symbols_trades_dict[symbol_to_run] = logged_trades_for_symbol
+
+                if logged_trades_for_symbol:
+                    pip_size_val = get_pip_size(symbol_to_run)
+                    print(f"  DEBUG: Calculating PnL R for {len(logged_trades_for_symbol)} trades for {symbol_to_run}") # Moved print
+                    for trade_idx, trade in enumerate(logged_trades_for_symbol): 
+                        if trade.get('exit_price') is not None and \
+                           trade.get('entry_price') is not None and \
+                           trade.get('initial_sl_price') is not None: # Check for initial_sl_price
+                            
+                            initial_sl = trade['initial_sl_price'] # Use the stored initial SL
+                            risk_pips = abs(trade['entry_price'] - initial_sl) / pip_size_val
+                            
+                            pnl_pips_val = 0
+                            if trade['direction'] == 'bullish': 
+                                pnl_pips_val = (trade['exit_price'] - trade['entry_price']) / pip_size_val
+                            elif trade['direction'] == 'bearish': 
+                                pnl_pips_val = (trade['entry_price'] - trade['exit_price']) / pip_size_val
+                            
+                            if risk_pips > 1e-9: 
+                                trade['pnl_R'] = round(pnl_pips_val / risk_pips, 2)
+                            else: 
+                                trade['pnl_R'] = 0 
+                            
+                            # <<< DEBUG PRINT FOR TP TRADES >>>
+                            if trade['status'] == 'closed_tp':
+                                print(f"    DEBUG_TRADE_PNL_R (TP): ID {trade['id']}, Entry {trade['entry_price']:.5f}, Exit {trade['exit_price']:.5f}, Initial_SL {initial_sl:.5f}, RiskPips {risk_pips:.2f}, PnLPips {pnl_pips_val:.2f}, PnL_R {trade['pnl_R']:.2f}, Target_RR {strategy_custom_params.get('TP_RR_RATIO', 'N/A')}")
+                            elif trade['status'] == 'closed_sl_be':
+                                print(f"    DEBUG_TRADE_PNL_R (SL@BE): ID {trade['id']}, Entry {trade['entry_price']:.5f}, Exit {trade['exit_price']:.5f}, Initial_SL {initial_sl:.5f}, RiskPips {risk_pips:.2f}, PnLPips {pnl_pips_val:.2f}, PnL_R {trade['pnl_R']:.2f}")
+                            elif trade['status'] == 'closed_sl':
+                                print(f"    DEBUG_TRADE_PNL_R (SL): ID {trade['id']}, Entry {trade['entry_price']:.5f}, Exit {trade['exit_price']:.5f}, Initial_SL {initial_sl:.5f}, RiskPips {risk_pips:.2f}, PnLPips {pnl_pips_val:.2f}, PnL_R {trade['pnl_R']:.2f}")
+
+
+                        else: 
+                             trade['pnl_R'] = 0 
+                             print(f"    DEBUG_TRADE_PNL_R: ID {trade.get('id','N/A')} missing price data for PnL R calc.")
+                    
+                    report_text_single = calculate_performance_metrics(
+                        logged_trades_for_symbol, config.INITIAL_CAPITAL, symbol_to_run, 
+                        pip_size_val, strategy_custom_params, session_results_path
+                    ) 
+                    if report_text_single: all_reports_text.append(report_text_single)
+                else:
+                    all_reports_text.append(f"\nNo trades for {symbol_to_run} with {active_strategy_name}.\n")
+            
+            if any(trade_list for trade_list in all_symbols_trades_dict.values()):
+                print(f"\n\n===== Generating Portfolio Performance Report ({active_strategy_name}) =====")
+                portfolio_report_text = calculate_portfolio_performance_metrics(
+                    all_symbols_trades_dict, config.INITIAL_CAPITAL, 
+                    strategy_custom_params, session_results_path
+                )
+                if portfolio_report_text: all_reports_text.append(portfolio_report_text)
+            else:
+                all_reports_text.append(f"\nNo trades generated across any symbols for portfolio report ({active_strategy_name}).\n")
+            
+            with open(report_file_path, "w") as f_report:
+                for report_section in all_reports_text:
+                    f_report.write(report_section + "\n\n")
+            print(f"Consolidated report saved to: {report_file_path}")
+            
+    finally:
+        shutdown_mt5_connection()
+        print("Application finished.")
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\plotly_plotting.py
+
+# forex_backtester_cli/plotly_plotting.py
+import plotly.graph_objects as go
+import plotly.offline as offline # For saving HTML
+import pandas as pd
+import os
+import MetaTrader5 as mt5 
+from data_handler import fetch_historical_data 
+
+def tf_mt5_to_minutes(tf_mt5_val: int) -> int:
+    if tf_mt5_val == mt5.TIMEFRAME_M1: return 1
+    if tf_mt5_val == mt5.TIMEFRAME_M5: return 5
+    if tf_mt5_val == mt5.TIMEFRAME_M15: return 15
+    if tf_mt5_val == mt5.TIMEFRAME_M30: return 30
+    if tf_mt5_val == mt5.TIMEFRAME_H1: return 60
+    if tf_mt5_val == mt5.TIMEFRAME_H4: return 240
+    if tf_mt5_val == mt5.TIMEFRAME_D1: return 1440
+    print(f"Warning: Unknown MT5 timeframe constant {tf_mt5_val} in tf_mt5_to_minutes. Defaulting to 60.")
+    return 60 
+
+def plot_trade_chart_plotly(trade_info: dict, 
+                            session_results_path: str,
+                            htf_plot_candles_lookback: int = 50,
+                            ltf_plot_candles_lookback: int = 200,
+                            ltf_plot_candles_forward: int = 100
+                            ):
+    overall_trade_id = trade_info.get('overall_trade_id', trade_info.get('id', 'UnknownID')) 
+    # print(f"  DEBUG_PLOT: Entered plot_trade_chart_plotly for Trade ID {overall_trade_id}") # Keep if needed
+    
+    symbol = trade_info['symbol']
+    entry_time = pd.to_datetime(trade_info['entry_time'])
+    entry_price = trade_info['entry_price']
+    sl_price = trade_info['sl_price']
+    tp_price = trade_info['tp_price']
+    direction = trade_info['direction']
+    status = trade_info['status']
+    exit_time = pd.to_datetime(trade_info.get('exit_time')) if trade_info.get('exit_time') else None
+    exit_price = trade_info.get('exit_price')
+
+    outcome_folder = "Win" if "tp" in status else "Loss" if "sl" in status else "Other"
+    direction_folder = "Longs" if direction == "bullish" else "Shorts"
+    trade_plot_dir = os.path.join(session_results_path, outcome_folder, direction_folder, f"Trade_{overall_trade_id}_{symbol}")
+    os.makedirs(trade_plot_dir, exist_ok=True)
+
+    plot_timeframes = {
+        "H4": (mt5.TIMEFRAME_H4, htf_plot_candles_lookback, "HTF_Context"), 
+        "H1": (mt5.TIMEFRAME_H1, 100, "H1_Context"),
+        "M30": (mt5.TIMEFRAME_M30, 150, "M30_Context"),
+        "M15": (mt5.TIMEFRAME_M15, ltf_plot_candles_lookback, "M15_Context"),
+        "M5": (mt5.TIMEFRAME_M5, ltf_plot_candles_lookback, "M5_EntryDetail") 
+    }
+
+    for tf_str, (tf_mt5, lookback_cfg, suffix) in plot_timeframes.items():
+        # print(f"    DEBUG_PLOT: Plotting {tf_str} for trade {overall_trade_id}...") 
+        minutes_for_lookback = tf_mt5_to_minutes(tf_mt5) * (lookback_cfg + 20) 
+        minutes_for_forward = tf_mt5_to_minutes(tf_mt5) * (ltf_plot_candles_forward if tf_str == "M5" else 30) 
+        fetch_start_dt = entry_time - pd.Timedelta(minutes=minutes_for_lookback)
+        fetch_end_dt = entry_time + pd.Timedelta(minutes=minutes_for_forward)
+
+        # print(f"      DEBUG_PLOT: Fetching data for {tf_str} from {fetch_start_dt.strftime('%Y-%m-%d %H:%M:%S')} to {fetch_end_dt.strftime('%Y-%m-%d %H:%M:%S')}")
+        current_tf_data = fetch_historical_data(symbol, tf_mt5, 
+                                                fetch_start_dt.strftime("%Y-%m-%d"), 
+                                                fetch_end_dt.strftime("%Y-%m-%d"))   
+            
+        if current_tf_data is None or current_tf_data.empty:
+            print(f"  Warning: Could not fetch data for {tf_str} plot for trade {overall_trade_id}.")
+            continue
+        
+        # print(f"      DEBUG_PLOT: Slicing data for {tf_str} plot...")
+        indexer_pos = current_tf_data.index.get_indexer([entry_time], method='ffill')[0]
+        if indexer_pos == -1: indexer_pos = current_tf_data.index.get_indexer([entry_time], method='bfill')[0]
+        if indexer_pos == -1: 
+            print(f"  Warning: Entry time {entry_time} could not be located in fetched {tf_str} data for trade {overall_trade_id}. Plotting approximate window.")
+            plot_slice = current_tf_data[
+                (current_tf_data.index >= entry_time - pd.Timedelta(minutes=tf_mt5_to_minutes(tf_mt5) * lookback_cfg)) &
+                (current_tf_data.index <= entry_time + pd.Timedelta(minutes=tf_mt5_to_minutes(tf_mt5) * (ltf_plot_candles_forward if tf_str == "M5" else 20)))
+            ]
+        else:
+            entry_idx_in_tf = indexer_pos
+            plot_start_idx = max(0, entry_idx_in_tf - lookback_cfg + 1) 
+            plot_end_idx_offset = ltf_plot_candles_forward if tf_str == "M5" else 20
+            plot_end_idx = min(len(current_tf_data), entry_idx_in_tf + plot_end_idx_offset + 1) 
+            plot_slice = current_tf_data.iloc[plot_start_idx:plot_end_idx]
+        
+        if plot_slice.empty:
+            print(f"  Warning: Plot slice empty for {tf_str} for trade {overall_trade_id}.")
+            continue
+            
+        fig = go.Figure(data=[go.Candlestick(x=plot_slice.index,
+                                             open=plot_slice['open'], high=plot_slice['high'],
+                                             low=plot_slice['low'], close=plot_slice['close'])])
+        shapes = []
+        annotations = []
+        plot_entry_time = entry_time
+        if not plot_slice.empty:
+            if entry_time < plot_slice.index[0]: plot_entry_time = plot_slice.index[0]
+            if entry_time > plot_slice.index[-1]: plot_entry_time = plot_slice.index[-1]
+
+        shapes.append(dict(type="line", xref="x", yref="y", x0=plot_entry_time, y0=entry_price, x1=plot_slice.index[-1] if not plot_slice.empty else plot_entry_time, y1=entry_price, line=dict(color="blue", width=1, dash="dash")))
+        annotations.append(dict(x=plot_entry_time, y=entry_price, text=f"E {entry_price:.5f}", showarrow=False, font=dict(color="blue"), xshift=-30, yshift=10 if direction == "bearish" else -10))
+        
+        shapes.append(dict(type="line", xref="x", yref="y", x0=plot_slice.index[0] if not plot_slice.empty else plot_entry_time, y0=sl_price, x1=plot_slice.index[-1] if not plot_slice.empty else plot_entry_time, y1=sl_price, line=dict(color="red", width=1, dash="dashdot")))
+        annotations.append(dict(x=plot_slice.index[0] if not plot_slice.empty else plot_entry_time, y=sl_price, text=f"SL {sl_price:.5f}", showarrow=False, xanchor="left", yanchor="bottom" if direction == "bullish" else "top", font=dict(color="red")))
+
+        shapes.append(dict(type="line", xref="x", yref="y", x0=plot_slice.index[0] if not plot_slice.empty else plot_entry_time, y0=tp_price, x1=plot_slice.index[-1] if not plot_slice.empty else plot_entry_time, y1=tp_price, line=dict(color="green", width=1, dash="dashdot")))
+        annotations.append(dict(x=plot_slice.index[0] if not plot_slice.empty else plot_entry_time, y=tp_price, text=f"TP {tp_price:.5f}", showarrow=False, xanchor="left", yanchor="top" if direction == "bullish" else "bottom", font=dict(color="green")))
+
+        if exit_time and exit_price and not plot_slice.empty and exit_time >= plot_slice.index[0] and exit_time <= plot_slice.index[-1]:
+            exit_marker_color = "darkred" if "sl" in status else "darkgreen" if "tp" in status else "grey"
+            shapes.append(dict(type="line", xref="x", yref="paper", x0=exit_time, y0=0, x1=exit_time, y1=1, line=dict(color=exit_marker_color, width=2, dash="dot")))
+            annotations.append(dict(x=exit_time, y=exit_price, text=f"X {exit_price:.5f}", showarrow=True, arrowhead=1, font=dict(color=exit_marker_color, size=10), ax=20, ay=-30))
+
+        fig.update_layout(
+            title=f"T{overall_trade_id}:{symbol} {tf_str} ({direction[:1].upper()}) E@{entry_price:.4f} SL@{sl_price:.4f} TP@{tp_price:.4f} Status:{status}",
+            xaxis_title="Time (UTC)", yaxis_title="Price",
+            xaxis_rangeslider_visible=True, # Enable rangeslider for HTML interactivity
+            shapes=shapes, annotations=annotations,
+            margin=dict(l=50, r=50, t=60, b=50) 
+        )
+        
+        plot_filename_html = os.path.join(trade_plot_dir, f"Trade_{overall_trade_id}_{symbol}_{suffix}.html") # Save as .html
+        # print(f"      DEBUG_PLOT: Attempting to save {tf_str} plot to {plot_filename_html}...")
+        try:
+            offline.plot(fig, filename=plot_filename_html, auto_open=False) # Use offline.plot
+            print(f"    Chart saved: {plot_filename_html}")
+        except Exception as e:
+            print(f"    Error saving plotly HTML chart {plot_filename_html}: {e}")
+        # print(f"    DEBUG_PLOT: Finished plotting {tf_str} for trade {overall_trade_id}.")
+
+    # print(f"  DEBUG_PLOT: Exiting plot_trade_chart_plotly for Trade ID {overall_trade_id}")
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\plotting_utils.py
+
+# forex_backtester_cli/plotting_utils.py
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
+import os
+
+def plot_ohlc_with_swings(
+    df_ohlc: pd.DataFrame, 
+    df_swings: pd.DataFrame, # DataFrame that includes swing_high and swing_low columns
+    symbol: str, 
+    timeframe_str: str, 
+    plot_title: str = "OHLC with Swing Points",
+    ha_mode: bool = False, # If true, use ha_open, ha_high etc.
+    choch_points: list = None, # List of tuples: [(time, price, 'type'), ...]
+    ltf_signals: list = None,  # List of tuples: [(time, price, 'type'), ...]
+    save_path: str = None
+    ):
+    """
+    Plots OHLC data with identified swing points, and optionally CHoCH/LTF signals.
+    Saves the plot if save_path is provided.
+    """
+    fig, ax = plt.subplots(figsize=(15, 7))
+
+    ohlc_cols = ['open', 'high', 'low', 'close']
+    if ha_mode:
+        ohlc_cols = ['ha_open', 'ha_high', 'ha_low', 'ha_close']
+        if not all(col in df_ohlc.columns for col in ohlc_cols):
+            print("Error: Heikin Ashi columns not found in DataFrame for HA plot.")
+            return
+
+    # Candlestick plot (simplified)
+    for index, row in df_ohlc.iterrows():
+        color = 'green' if row[ohlc_cols[3]] >= row[ohlc_cols[0]] else 'red'
+        # Plot body
+        ax.plot([index, index], [row[ohlc_cols[0]], row[ohlc_cols[3]]], color=color, linewidth=2)
+        # Plot wicks
+        ax.plot([index, index], [row[ohlc_cols[2]], row[ohlc_cols[1]]], color=color, linewidth=0.5)
+
+    # Plot Swing Highs
+    swing_highs_to_plot = df_swings[df_swings['swing_high'].notna()]
+    ax.scatter(swing_highs_to_plot.index, swing_highs_to_plot['swing_high'] + (df_ohlc[ohlc_cols[1]].std() * 0.1), 
+               color='red', marker='v', s=50, label='Swing High', zorder=5)
+
+    # Plot Swing Lows
+    swing_lows_to_plot = df_swings[df_swings['swing_low'].notna()]
+    ax.scatter(swing_lows_to_plot.index, swing_lows_to_plot['swing_low'] - (df_ohlc[ohlc_cols[1]].std() * 0.1), 
+               color='lime', marker='^', s=50, label='Swing Low', zorder=5)
+
+    # Plot CHoCH points
+    if choch_points:
+        for ch_time, ch_price, ch_type in choch_points:
+            color = 'magenta' if 'bullish' in ch_type else 'cyan'
+            marker = 'P' # Plus sign
+            ax.scatter(ch_time, ch_price, color=color, marker=marker, s=150, label=f"{ch_type.split('_')[0].upper()} CHoCH Line", zorder=6, edgecolor='black')
+            ax.axhline(y=ch_price, color=color, linestyle='--', linewidth=1.5, alpha=0.7, xmin=0.05, xmax=0.95) # Line for CHoCH level
+            # Annotate the CHoCH point
+            ax.annotate(f"{ch_type.split('_')[0][:1]}CH@{'%.5f'%ch_price}", (ch_time, ch_price), textcoords="offset points", xytext=(0,10), ha='center', fontsize=9, color=color)
+
+
+    # Plot LTF entry signals
+    if ltf_signals:
+        for sig_time, sig_price, sig_type in ltf_signals:
+            color = 'blue' if 'bullish' in sig_type else 'orange'
+            marker = '*'
+            ax.scatter(sig_time, sig_price, color=color, marker=marker, s=150, label=f"LTF Signal ({sig_type.split('_')[1]})", zorder=7, edgecolor='black')
+            ax.annotate(f"LTF {sig_type.split('_')[1][:1].upper()}S", (sig_time, sig_price), textcoords="offset points", xytext=(0,-15), ha='center', fontsize=9, color=color)
+
+
+    ax.set_title(f"{plot_title} - {symbol} {timeframe_str}")
+    ax.set_ylabel("Price")
+    ax.legend()
+    ax.grid(True, linestyle='--', alpha=0.7)
+
+    # Format x-axis dates
+    ax.xaxis.set_major_formatter(mdates.DateFormatter('%Y-%m-%d %H:%M'))
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+
+    if save_path:
+        try:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path)
+            print(f"Plot saved to {save_path}")
+        except Exception as e:
+            print(f"Error saving plot: {e}")
+    else:
+        plt.show()
+    plt.close(fig) # Close the figure to free memory
+
+if __name__ == '__main__':
+    # Create dummy data for testing the plotting function
+    from datetime import datetime, timedelta
+    idx = pd.to_datetime([datetime(2023,1,1, H, M) for H in range(1,3) for M in range(0, 60, 5)])
+    data = {
+        'open': np.random.rand(len(idx)) * 10 + 100,
+        'close': np.random.rand(len(idx)) * 10 + 100,
+        'high': np.random.rand(len(idx)) * 5 + 105,
+        'low': 100 - np.random.rand(len(idx)) * 5,
+    }
+    # Ensure high is highest and low is lowest
+    for i in range(len(idx)):
+        data['high'][i] = max(data['open'][i], data['close'][i], data['high'][i])
+        data['low'][i] = min(data['open'][i], data['close'][i], data['low'][i])
+
+    dummy_df = pd.DataFrame(data, index=idx)
+    dummy_df['swing_high'] = np.nan
+    dummy_df['swing_low'] = np.nan
+    dummy_df.loc[dummy_df.index[5], 'swing_high'] = dummy_df.loc[dummy_df.index[5], 'high']
+    dummy_df.loc[dummy_df.index[10], 'swing_low'] = dummy_df.loc[dummy_df.index[10], 'low']
+    dummy_df.loc[dummy_df.index[15], 'swing_high'] = dummy_df.loc[dummy_df.index[15], 'high']
+
+    choch_test_points = [(dummy_df.index[8], dummy_df.loc[dummy_df.index[10], 'low'], 'bearish_choch_test')]
+    ltf_test_signals = [(dummy_df.index[12], dummy_df.loc[dummy_df.index[12], 'close'], 'ltf_bullish_confirm_test')]
+
+    plot_ohlc_with_swings(dummy_df, dummy_df, "DUMMY", "M5", "Test Plot", 
+                          choch_points=choch_test_points, 
+                          ltf_signals=ltf_test_signals,
+                          save_path="plots/dummy_plot.png")
+    print("Plotting test finished. Check for plots/dummy_plot.png")
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\reporting.py
+
+# forex_backtester_cli/reporting.py
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+from config import INITIAL_CAPITAL
+
+# forex_backtester_cli/reporting.py
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import os
+# from config import INITIAL_CAPITAL, TP_RR_RATIO # TP_RR_RATIO will come from strategy_params_used
+from config import INITIAL_CAPITAL # Keep INITIAL_CAPITAL if used for other calcs, though R-focus reduces its direct use here
+
+def calculate_performance_metrics(trades_log: list, 
+                                  initial_capital: float, 
+                                  symbol: str, 
+                                  pip_size: float,
+                                  strategy_params_used: dict, 
+                                  session_results_path: str):
+    """
+    Calculates and prints key performance metrics from a list of trades for a single symbol.
+    Saves the equity curve plot to the specified session path.
+    Returns the report as a string.
+    """
+    if not trades_log:
+        report_text = f"No trades to report for {symbol}.\n"
+        print(report_text)
+        return report_text 
+
+    df_trades = pd.DataFrame(trades_log)
+
+    # Ensure numeric types and handle potential NaNs
+    df_trades['pnl_pips'] = pd.to_numeric(df_trades['pnl_pips'], errors='coerce')
+    df_trades['pnl_R'] = pd.to_numeric(df_trades['pnl_R'], errors='coerce').fillna(0) 
+    df_trades['max_R_achieved_for_analysis'] = pd.to_numeric(df_trades.get('max_R_achieved_for_analysis'), errors='coerce').fillna(0)
+    
+    total_trades = len(df_trades)
+    
+    # Categorize trades
+    winning_trades = df_trades[df_trades['pnl_R'] > 0.01] # Wins if R > 0.01 (to exclude tiny positives from BE)
+    losing_trades_strict = df_trades[df_trades['pnl_R'] < -0.01] # Losses if R < -0.01
+    
+    # Breakeven trades: status is 'closed_sl_be' AND pnl_R is close to 0
+    # Or any trade where pnl_R is very close to 0, regardless of status (e.g. EOD close at entry)
+    breakeven_trades = df_trades[
+        ((df_trades['status'] == 'closed_sl_be') & (abs(df_trades['pnl_R']) <= 0.01)) |
+        ((df_trades['status'] != 'closed_sl_be') & (abs(df_trades['pnl_R']) <= 0.01))
+    ]
+    # Ensure trades counted as BE are not also counted as strict wins/losses
+    winning_trades = winning_trades[~winning_trades.index.isin(breakeven_trades.index)]
+    losing_trades_strict = losing_trades_strict[~losing_trades_strict.index.isin(breakeven_trades.index)]
+
+    num_wins = len(winning_trades)
+    num_losses = len(losing_trades_strict) # Use strict losses for loss count
+    num_be = len(breakeven_trades)
+    num_sl_be_hits = len(df_trades[df_trades['status'] == 'closed_sl_be']) # Count all BE SL hits
+
+    win_rate = (num_wins / total_trades) * 100 if total_trades > 0 else 0
+    loss_rate = (num_losses / total_trades) * 100 if total_trades > 0 else 0 # Based on strict losses
+
+    avg_win_r = winning_trades['pnl_R'].mean() if num_wins > 0 else 0
+    avg_loss_r = losing_trades_strict['pnl_R'].mean() if num_losses > 0 else 0 # Use strict losses for avg loss
+
+    expectancy_r = 0
+    if total_trades > 0:
+        # Expectancy considers all outcomes, including breakevens (which have pnl_R ~ 0)
+        # So, use win_rate (for wins) and loss_rate (for strict losses). BE trades contribute ~0 to expectancy.
+        expectancy_r = ( (win_rate / 100) * avg_win_r ) + \
+                       ( (loss_rate / 100) * avg_loss_r ) 
+    
+    total_r_won = winning_trades['pnl_R'].sum()
+    total_r_lost = abs(losing_trades_strict['pnl_R'].sum()) # Sum of strict losses
+    profit_factor = total_r_won / total_r_lost if total_r_lost > 0 else np.inf if total_r_won > 0 else 1.0
+
+    df_trades['cumulative_R'] = df_trades['pnl_R'].cumsum()
+    
+    peak_r = df_trades['cumulative_R'].expanding(min_periods=1).max()
+    drawdown_r_series = peak_r - df_trades['cumulative_R']
+    max_drawdown_r = drawdown_r_series.max() if not drawdown_r_series.empty else 0.0
+    
+    avg_max_r_analysis = df_trades['max_R_achieved_for_analysis'].mean() if not df_trades['max_R_achieved_for_analysis'].empty else 0.0
+    median_max_r_analysis = df_trades['max_R_achieved_for_analysis'].median() if not df_trades['max_R_achieved_for_analysis'].empty else 0.0
+
+    tp_rr_ratio_for_report = strategy_params_used.get("TP_RR_RATIO", "N/A (Not in params)")
+    df_trades['entry_time'] = pd.to_datetime(df_trades['entry_time'])
+    # Ensure exit_time exists and handle NaT for trades that might not have exited (though all should have a status)
+    df_trades['exit_time'] = pd.to_datetime(df_trades['exit_time'], errors='coerce') 
+    
+    period_start_str = df_trades['entry_time'].min().strftime('%Y-%m-%d %H:%M') if not df_trades.empty and df_trades['entry_time'].notna().any() else "N/A"
+    period_end_str = df_trades['exit_time'].max().strftime('%Y-%m-%d %H:%M') if not df_trades.empty and df_trades['exit_time'].notna().any() else "N/A"
+
+    report_lines = [
+        f"--------------------------------------------------",
+        f"Backtest Performance Report for: {symbol}",
+        f"Period: {period_start_str} to {period_end_str}",
+        f"Target R:R Ratio (TP): 1:{tp_rr_ratio_for_report}",
+        f"--------------------------------------------------",
+        f"Total Trades:              {total_trades}",
+        f"Winning Trades (>0.01R):   {num_wins} ({win_rate:.2f}%)",
+        f"Losing Trades (<-0.01R):   {num_losses} ({loss_rate:.2f}%)",
+        f"Breakeven Trades (at BE SL): {num_sl_be_hits}",
+        f"Other Breakeven (~0R):   {num_be - num_sl_be_hits if num_be >= num_sl_be_hits else num_be}", # BE not from SL_BE status
+        f"--------------------------------------------------",
+        f"Average Win (R):           {avg_win_r:.2f} R",
+        f"Average Loss (R):          {avg_loss_r:.2f} R ",
+        f"Expectancy (R):            {expectancy_r:.2f} R per trade",
+        f"Profit Factor:             {profit_factor:.2f}",
+        f"--------------------------------------------------",
+        f"Total R Won:               {total_r_won:.2f} R",
+        f"Total R Lost:              {total_r_lost:.2f} R",
+        f"Net Profit (R):            {df_trades['cumulative_R'].iloc[-1] if not df_trades.empty else 0.0:.2f} R",
+        f"--------------------------------------------------",
+        f"Max Drawdown (R):          {max_drawdown_r:.2f} R",
+        f"Avg Max R Achieved (Analysis):   {avg_max_r_analysis:.2f} R (capped at 5R)",
+        f"Median Max R Achieved (Analysis):{median_max_r_analysis:.2f} R (capped at 5R)",
+        f"--------------------------------------------------",
+        f"R-Level Achievement Counts (Analysis up to 5R):"
+    ]
+    
+    r_levels_to_report_analysis = strategy_params_used.get("R_LEVELS_TO_TRACK", []) + [3.5, 4.0, 4.5, 5.0]
+    all_r_levels_for_report = sorted(list(set(r_levels_to_report_analysis)))
+
+    for r_val in all_r_levels_for_report:
+        if r_val > 5.0: continue 
+        col_name = f'{r_val:.1f}R_achieved' # Ensure consistent naming with .1f for float keys
+        count = df_trades[col_name].sum() if col_name in df_trades.columns else 0
+        percentage = (count / total_trades) * 100 if total_trades > 0 else 0
+        report_lines.append(f"    {r_val:.1f}R Achieved:            {count} trades ({percentage:.2f}%)")
+    report_lines.append(f"--------------------------------------------------")
+    
+    report_text = "\n".join(report_lines)
+    print(report_text) 
+    
+    if not df_trades.empty:
+        plot_dir = os.path.join(session_results_path, "EquityCurves") 
+        os.makedirs(plot_dir, exist_ok=True)
+        equity_curve_path = os.path.join(plot_dir, f"{symbol}_equity_curve_R.png")
+        
+        plt.figure(figsize=(12, 6))
+        plt.plot(df_trades.index, df_trades['cumulative_R'], label=f'Equity Curve (R) for {symbol}')
+        plt.title(f'Cumulative R Profit Over Trades - {symbol}')
+        plt.xlabel('Trade Number'); plt.ylabel('Cumulative R')
+        plt.legend(); plt.grid(True)
+        try:
+            plt.savefig(equity_curve_path)
+            print(f"Equity curve saved to {equity_curve_path}")
+        except Exception as e: print(f"Error saving equity curve plot for {symbol}: {e}")
+        plt.close()
+
+    return report_text
+
+def calculate_portfolio_performance_metrics(all_symbols_trades_logs: dict, 
+                                            initial_capital: float, 
+                                            strategy_params_used: dict,
+                                            session_results_path: str):
+    if not all_symbols_trades_logs:
+        report_text = "No trade logs provided for portfolio reporting.\n" # Define report_text
+        print(report_text)
+        return report_text # Return the defined message
+
+    combined_trades_list = []
+    for symbol, trades_log in all_symbols_trades_logs.items():
+        if trades_log: 
+            for trade in trades_log:
+                if trade.get('exit_time') is not None and trade.get('pnl_R') is not None:
+                    trade['symbol_id'] = symbol 
+                    combined_trades_list.append(trade)
+                elif trade.get('status') == 'open' and trade.get('pnl_R') is not None: 
+                    trade['symbol_id'] = symbol
+                    combined_trades_list.append(trade)
+
+    if not combined_trades_list:
+        report_text = "No valid closed/completed trades found across all symbols for portfolio report.\n" # Define report_text
+        print(report_text)
+        return report_text # Return the defined message
+        
+    df_portfolio_trades = pd.DataFrame(combined_trades_list)
+    # ... (rest of the function as in the previous correct version) ...
+    df_portfolio_trades['exit_time'] = pd.to_datetime(df_portfolio_trades['exit_time'])
+    df_portfolio_trades['entry_time'] = pd.to_datetime(df_portfolio_trades['entry_time'])
+    df_portfolio_trades['pnl_R'] = pd.to_numeric(df_portfolio_trades['pnl_R'], errors='coerce').fillna(0)
+    df_portfolio_trades.sort_values(by=['exit_time', 'entry_time', 'id'], inplace=True)
+    df_portfolio_trades.reset_index(drop=True, inplace=True) 
+
+    df_portfolio_trades['portfolio_cumulative_R'] = df_portfolio_trades['pnl_R'].cumsum()
+    peak_portfolio_r = df_portfolio_trades['portfolio_cumulative_R'].expanding(min_periods=1).max()
+    drawdown_portfolio_r_series = peak_portfolio_r - df_portfolio_trades['portfolio_cumulative_R']
+    max_drawdown_portfolio_r = drawdown_portfolio_r_series.max() if not drawdown_portfolio_r_series.empty else 0.0
+    
+    total_portfolio_trades = len(df_portfolio_trades)
+    num_wins_portfolio = len(df_portfolio_trades[df_portfolio_trades['pnl_R'] > 0])
+    num_losses_portfolio = len(df_portfolio_trades[df_portfolio_trades['pnl_R'] < 0])
+    num_be_portfolio = len(df_portfolio_trades[df_portfolio_trades['pnl_R'] == 0])
+    win_rate_portfolio = (num_wins_portfolio / total_portfolio_trades) * 100 if total_portfolio_trades > 0 else 0
+    
+    avg_win_r_portfolio = df_portfolio_trades[df_portfolio_trades['pnl_R'] > 0]['pnl_R'].mean() if num_wins_portfolio > 0 else 0
+    avg_loss_r_portfolio = df_portfolio_trades[df_portfolio_trades['pnl_R'] < 0]['pnl_R'].mean() if num_losses_portfolio > 0 else 0 
+    
+    expectancy_r_portfolio = 0
+    if total_portfolio_trades > 0:
+        loss_rate_portfolio = num_losses_portfolio / total_portfolio_trades
+        expectancy_r_portfolio = ( (win_rate_portfolio / 100) * avg_win_r_portfolio ) + \
+                                 ( loss_rate_portfolio * avg_loss_r_portfolio )
+
+    total_r_won_portfolio = df_portfolio_trades[df_portfolio_trades['pnl_R'] > 0]['pnl_R'].sum()
+    total_r_lost_portfolio = abs(df_portfolio_trades[df_portfolio_trades['pnl_R'] < 0]['pnl_R'].sum())
+    profit_factor_portfolio = total_r_won_portfolio / total_r_lost_portfolio if total_r_lost_portfolio > 0 else np.inf if total_r_won_portfolio > 0 else 1.0
+
+    tp_rr_ratio_for_report = strategy_params_used.get("TP_RR_RATIO", "N/A")
+    
+    report_lines = [
+        "\n\n--- Portfolio Performance Report ---",
+        f"Symbols: {', '.join(all_symbols_trades_logs.keys())}",
+        f"Strategy Target R:R Ratio (TP): 1:{tp_rr_ratio_for_report}"
+    ]
+    if not df_portfolio_trades.empty:
+        report_lines.append(f"Period: {df_portfolio_trades['entry_time'].min().strftime('%Y-%m-%d')} to {df_portfolio_trades['exit_time'].max().strftime('%Y-%m-%d')}")
+    report_lines.extend([
+        "------------------------------------",
+        f"Total Trades in Portfolio: {total_portfolio_trades}",
+        f"Winning Trades:            {num_wins_portfolio} ({win_rate_portfolio:.2f}%)",
+        f"Losing Trades:             {num_losses_portfolio}",
+        f"Breakeven Trades:          {num_be_portfolio}",
+        f"Average Win (R):           {avg_win_r_portfolio:.2f} R",
+        f"Average Loss (R):          {avg_loss_r_portfolio:.2f} R",
+        f"Expectancy (R):            {expectancy_r_portfolio:.2f} R per trade",
+        f"Profit Factor:             {profit_factor_portfolio:.2f}"
+    ])
+    if not df_portfolio_trades.empty:
+        report_lines.append(f"Net Portfolio Profit (R):  {df_portfolio_trades['portfolio_cumulative_R'].iloc[-1]:.2f} R")
+    else:
+        report_lines.append(f"Net Portfolio Profit (R):  0.00 R")
+    report_lines.extend([
+        f"Max Portfolio Drawdown (R):{max_drawdown_portfolio_r:.2f} R",
+        "------------------------------------"
+    ])
+    report_text = "\n".join(report_lines) # Define report_text here before printing
+    print(report_text)
+
+    if not df_portfolio_trades.empty:
+        plot_dir = os.path.join(session_results_path, "EquityCurves") 
+        os.makedirs(plot_dir, exist_ok=True)
+        equity_curve_path = os.path.join(plot_dir, "portfolio_equity_curve_R.png")
+        
+        plt.figure(figsize=(12, 6))
+        plt.plot(df_portfolio_trades.index, df_portfolio_trades['portfolio_cumulative_R'], label='Portfolio Equity Curve (R)')
+        plt.title('Portfolio Cumulative R Profit Over Trades (Sorted by Exit Time)')
+        plt.xlabel('Trade Number (Chronological by Exit)')
+        plt.ylabel('Cumulative R')
+        plt.legend(); plt.grid(True)
+        try:
+            plt.savefig(equity_curve_path)
+            print(f"Portfolio equity curve saved to {equity_curve_path}")
+        except Exception as e: print(f"Error saving portfolio equity curve plot: {e}")
+        plt.close()
+        
+    return report_text # Now report_text is always defined before return
+
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\strategy_logic.py
+
+# forex_backtester_cli/strategy_logic.py
+import pandas as pd
+import numpy as np
+
+DEBUG_STRATEGY_LOGIC = True 
+
+def get_market_structure_and_recent_swings(df_with_swings: pd.DataFrame, current_eval_time: pd.Timestamp):
+    """
+    Analyzes swings confirmed *before or at current_eval_time* to determine market structure.
+    """
+    if DEBUG_STRATEGY_LOGIC: print(f"  DEBUG: get_market_structure called for time <= {current_eval_time} with full df shape {df_with_swings.shape}")
+    
+    # Filter swings that occurred at or before the current evaluation time
+    confirmed_swings = df_with_swings[df_with_swings.index <= current_eval_time]
+    swing_highs = confirmed_swings[confirmed_swings['swing_high'].notna()]
+    swing_lows = confirmed_swings[confirmed_swings['swing_low'].notna()]
+
+    if DEBUG_STRATEGY_LOGIC:
+        print(f"    Considering swings up to {current_eval_time}: Found {len(swing_highs)} swing highs, {len(swing_lows)} swing lows.")
+        if not swing_highs.empty: print(f"    Latest considered SH: {swing_highs.iloc[-1]['swing_high']:.5f} at {swing_highs.index[-1]}")
+        if not swing_lows.empty: print(f"    Latest considered SL: {swing_lows.iloc[-1]['swing_low']:.5f} at {swing_lows.index[-1]}")
+
+    if swing_highs.empty or swing_lows.empty or len(swing_highs) < 2 or len(swing_lows) < 2:
+        if DEBUG_STRATEGY_LOGIC: print("    Not enough confirmed swings (need >=2 of each type) up to this point for structure determination.")
+        return "undetermined", None, None, None, None
+
+    last_sh = swing_highs.iloc[-1]
+    second_last_sh = swing_highs.iloc[-2]
+    last_sl = swing_lows.iloc[-1]
+    second_last_sl = swing_lows.iloc[-2]
+
+    market_structure = "ranging" 
+
+    if last_sh['swing_high'] > second_last_sh['swing_high'] and \
+       last_sl['swing_low'] > second_last_sl['swing_low']:
+        if last_sh.name > last_sl.name and last_sl.name > second_last_sh.name:
+             market_structure = "uptrend"
+    elif last_sh['swing_high'] < second_last_sh['swing_high'] and \
+         last_sl['swing_low'] < second_last_sl['swing_low']:
+        if last_sl.name > last_sh.name and last_sh.name > second_last_sl.name:
+            market_structure = "downtrend"
+    
+    if DEBUG_STRATEGY_LOGIC: print(f"    Determined structure based on swings up to {current_eval_time}: {market_structure}")
+    
+    # For CHoCH, we need the last structural point of the identified trend.
+    # If uptrend, it's the last HL (which would be `last_sl` if structure is correctly identified).
+    # If downtrend, it's the last LH (which would be `last_sh`).
+    # This part is crucial and might need more advanced logic to pick the *correct* structural HL/LH.
+    # For now, we return the latest identified swings from the filtered set.
+    
+    return market_structure, \
+           last_sh['swing_high'], last_sh.name, \
+           last_sl['swing_low'], last_sl.name
+
+
+def detect_choch(df_ohlc_with_swings: pd.DataFrame, current_candle_index: int, break_type: str = "close"):
+    current_candle = df_ohlc_with_swings.iloc[current_candle_index]
+    current_time = current_candle.name 
+    
+    # The structure (HL or LH to be broken) must be established *before* the current candle's time.
+    # So, we evaluate structure based on swings confirmed up to the *previous* candle's time.
+    time_for_structure_eval = df_ohlc_with_swings.index[current_candle_index - 1] if current_candle_index > 0 else df_ohlc_with_swings.index[0]
+
+    if DEBUG_STRATEGY_LOGIC: print(f"\nDEBUG: detect_choch for current candle at {current_time} (index {current_candle_index}). Evaluating structure up to {time_for_structure_eval}.")
+
+    if current_candle_index < 1: return None, None, None # Should be handled by backtester loop start
+    
+    # Get structure based on swings confirmed up to the *previous* candle's time.
+    structure, struct_sh_price, struct_sh_time, struct_sl_price, struct_sl_time = \
+        get_market_structure_and_recent_swings(df_ohlc_with_swings, time_for_structure_eval)
+
+    if DEBUG_STRATEGY_LOGIC:
+        print(f"  CHoCH Check: Current Candle Time: {current_time}")
+        print(f"  Evaluated Structure (up to {time_for_structure_eval}): {structure}")
+        if struct_sh_time: print(f"  Relevant Structural SH for break check: {struct_sh_price:.5f} at {struct_sh_time}")
+        if struct_sl_time: print(f"  Relevant Structural SL for break check: {struct_sl_price:.5f} at {struct_sl_time}")
+
+    # Bearish CHoCH: Was in uptrend, current candle breaks the last significant Higher Low (struct_sl_price)
+    if structure == "uptrend" and struct_sl_price is not None: # struct_sl_time will be <= time_for_structure_eval
+        point_to_break = struct_sl_price
+        if DEBUG_STRATEGY_LOGIC: print(f"    Potential Bearish CHoCH: Uptrend context. Watching HL at {point_to_break:.5f} (time {struct_sl_time}). Current close: {current_candle['close']:.5f}, low: {current_candle['low']:.5f}")
+        if break_type == "close":
+            if current_candle['close'] < point_to_break:
+                if DEBUG_STRATEGY_LOGIC: print(f"      >>> BEARISH CHOCH by CLOSE confirmed!")
+                return "bearish_choch", point_to_break, current_time
+        elif break_type == "wick":
+            if current_candle['low'] < point_to_break:
+                if DEBUG_STRATEGY_LOGIC: print(f"      >>> BEARISH CHOCH by WICK confirmed!")
+                return "bearish_choch", point_to_break, current_time
+
+    # Bullish CHoCH: Was in downtrend, current candle breaks the last significant Lower High (struct_sh_price)
+    elif structure == "downtrend" and struct_sh_price is not None:
+        point_to_break = struct_sh_price
+        if DEBUG_STRATEGY_LOGIC: print(f"    Potential Bullish CHoCH: Downtrend context. Watching LH at {point_to_break:.5f} (time {struct_sh_time}). Current close: {current_candle['close']:.5f}, high: {current_candle['high']:.5f}")
+        if break_type == "close":
+            if current_candle['close'] > point_to_break:
+                if DEBUG_STRATEGY_LOGIC: print(f"      >>> BULLISH CHOCH by CLOSE confirmed!")
+                return "bullish_choch", point_to_break, current_time
+        elif break_type == "wick":
+            if current_candle['high'] > point_to_break:
+                if DEBUG_STRATEGY_LOGIC: print(f"      >>> BULLISH CHOCH by WICK confirmed!")
+                return "bullish_choch", point_to_break, current_time
+                
+    return None, None, None
+
+# LTF function also needs to be adjusted similarly if it uses get_market_structure_and_recent_swings
+def detect_ltf_structure_change(df_ltf_ha_with_swings: pd.DataFrame, 
+                                current_ltf_candle_index: int, 
+                                required_direction: str, 
+                                break_type: str = "close"):
+    current_ltf_candle = df_ltf_ha_with_swings.iloc[current_ltf_candle_index]
+    current_ltf_time = current_ltf_candle.name
+    
+    time_for_ltf_structure_eval = df_ltf_ha_with_swings.index[current_ltf_candle_index - 1] if current_ltf_candle_index > 0 else df_ltf_ha_with_swings.index[0]
+
+    if DEBUG_STRATEGY_LOGIC: print(f"  DEBUG: detect_ltf_structure_change for HA candle at {current_ltf_time} (index {current_ltf_candle_index}), required: {required_direction}. Evaluating structure up to {time_for_ltf_structure_eval}")
+
+    if current_ltf_candle_index < 1: return None, None, None
+
+    ltf_structure, last_ltf_sh_price, last_ltf_sh_time, last_ltf_sl_price, last_ltf_sl_time = \
+        get_market_structure_and_recent_swings(df_ltf_ha_with_swings, time_for_ltf_structure_eval) # Pass full df and eval time
+
+    # ... (rest of LTF logic remains similar, checking against the returned structural points) ...
+    if DEBUG_STRATEGY_LOGIC:
+        print(f"    LTF Structure (up to {time_for_ltf_structure_eval}): {ltf_structure}")
+        if last_ltf_sh_time: print(f"    LTF Relevant Structural SH: {last_ltf_sh_price:.5f} at {last_ltf_sh_time}")
+        if last_ltf_sl_time: print(f"    LTF Relevant Structural SL: {last_ltf_sl_price:.5f} at {last_ltf_sl_time}")
+
+    if required_direction == "bullish":
+        # For bullish confirmation, we could be breaking a previous LH (CHoCH) or a previous SH (BOS)
+        # The `last_ltf_sh_price` from `get_market_structure_and_recent_swings` is the latest SH.
+        # If ltf_structure was 'downtrend', this `last_ltf_sh_price` is the LH to break for a CHoCH.
+        # If ltf_structure was 'uptrend', this `last_ltf_sh_price` is the SH to break for a BOS.
+        point_to_break = last_ltf_sh_price 
+        if point_to_break is not None: # last_ltf_sh_time will be <= time_for_ltf_structure_eval
+            if DEBUG_STRATEGY_LOGIC: print(f"      LTF Bullish Check: Watching level {point_to_break:.5f}. Current HA_close: {current_ltf_candle['ha_close']:.5f}, HA_high: {current_ltf_candle['ha_high']:.5f}")
+            if break_type == "close" and current_ltf_candle['ha_close'] > point_to_break:
+                signal = "ltf_bullish_confirm_choch" if ltf_structure == "downtrend" or ltf_structure == "ranging" else "ltf_bullish_confirm_bos"
+                if DEBUG_STRATEGY_LOGIC: print(f"        >>> LTF BULLISH CONFIRM by CLOSE ({signal})!")
+                return signal, point_to_break, current_ltf_time
+            elif break_type == "wick" and current_ltf_candle['ha_high'] > point_to_break:
+                signal = "ltf_bullish_confirm_choch" if ltf_structure == "downtrend" or ltf_structure == "ranging" else "ltf_bullish_confirm_bos"
+                if DEBUG_STRATEGY_LOGIC: print(f"        >>> LTF BULLISH CONFIRM by WICK ({signal})!")
+                return signal, point_to_break, current_ltf_time
+
+    elif required_direction == "bearish":
+        point_to_break = last_ltf_sl_price
+        if point_to_break is not None:
+            if DEBUG_STRATEGY_LOGIC: print(f"      LTF Bearish Check: Watching level {point_to_break:.5f}. Current HA_close: {current_ltf_candle['ha_close']:.5f}, HA_low: {current_ltf_candle['ha_low']:.5f}")
+            if break_type == "close" and current_ltf_candle['ha_close'] < point_to_break:
+                signal = "ltf_bearish_confirm_choch" if ltf_structure == "uptrend" or ltf_structure == "ranging" else "ltf_bearish_confirm_bos"
+                if DEBUG_STRATEGY_LOGIC: print(f"        >>> LTF BEARISH CONFIRM by CLOSE ({signal})!")
+                return signal, point_to_break, current_ltf_time
+            elif break_type == "wick" and current_ltf_candle['ha_low'] < point_to_break:
+                signal = "ltf_bearish_confirm_choch" if ltf_structure == "uptrend" or ltf_structure == "ranging" else "ltf_bearish_confirm_bos"
+                if DEBUG_STRATEGY_LOGIC: print(f"        >>> LTF BEARISH CONFIRM by WICK ({signal})!")
+                return signal, point_to_break, current_ltf_time
+                
+    return None, None, None
+
+
+def detect_ltf_structure_change(df_ltf_ha_with_swings: pd.DataFrame, 
+                                current_ltf_candle_index: int, 
+                                required_direction: str, 
+                                break_type: str = "close"):
+    current_ltf_candle = df_ltf_ha_with_swings.iloc[current_ltf_candle_index]
+    current_ltf_time = current_ltf_candle.name
+    
+    # Determine the time up to which structure should be evaluated (previous candle's time)
+    time_for_ltf_structure_eval = df_ltf_ha_with_swings.index[current_ltf_candle_index - 1] if current_ltf_candle_index > 0 else df_ltf_ha_with_swings.index[0]
+
+    if DEBUG_STRATEGY_LOGIC: print(f"  DEBUG: detect_ltf_structure_change for HA candle at {current_ltf_time} (index {current_ltf_candle_index}), required: {required_direction}. Evaluating structure up to {time_for_ltf_structure_eval}")
+
+    if current_ltf_candle_index < 1: return None, None, None
+
+    # Call get_market_structure_and_recent_swings with the current_eval_time argument
+    ltf_structure, last_ltf_sh_price, last_ltf_sh_time, last_ltf_sl_price, last_ltf_sl_time = \
+        get_market_structure_and_recent_swings(df_ltf_ha_with_swings, time_for_ltf_structure_eval) # <<< CORRECTED CALL
+
+    if DEBUG_STRATEGY_LOGIC:
+        print(f"    LTF Structure (up to {time_for_ltf_structure_eval}): {ltf_structure}")
+        if last_ltf_sh_time: print(f"    LTF Relevant Structural SH: {last_ltf_sh_price:.5f} at {last_ltf_sh_time}")
+        if last_ltf_sl_time: print(f"    LTF Relevant Structural SL: {last_ltf_sl_price:.5f} at {last_ltf_sl_time}")
+
+    if required_direction == "bullish":
+        point_to_break = last_ltf_sh_price 
+        if point_to_break is not None: 
+            if DEBUG_STRATEGY_LOGIC: print(f"      LTF Bullish Check: Watching level {point_to_break:.5f}. Current HA_close: {current_ltf_candle['ha_close']:.5f}, HA_high: {current_ltf_candle['ha_high']:.5f}")
+            if break_type == "close" and current_ltf_candle['ha_close'] > point_to_break:
+                signal = "ltf_bullish_confirm_choch" if ltf_structure == "downtrend" or ltf_structure == "ranging" else "ltf_bullish_confirm_bos"
+                if DEBUG_STRATEGY_LOGIC: print(f"        >>> LTF BULLISH CONFIRM by CLOSE ({signal})!")
+                return signal, point_to_break, current_ltf_time
+            elif break_type == "wick" and current_ltf_candle['ha_high'] > point_to_break:
+                signal = "ltf_bullish_confirm_choch" if ltf_structure == "downtrend" or ltf_structure == "ranging" else "ltf_bullish_confirm_bos"
+                if DEBUG_STRATEGY_LOGIC: print(f"        >>> LTF BULLISH CONFIRM by WICK ({signal})!")
+                return signal, point_to_break, current_ltf_time
+
+    elif required_direction == "bearish":
+        point_to_break = last_ltf_sl_price
+        if point_to_break is not None:
+            if DEBUG_STRATEGY_LOGIC: print(f"      LTF Bearish Check: Watching level {point_to_break:.5f}. Current HA_close: {current_ltf_candle['ha_close']:.5f}, HA_low: {current_ltf_candle['ha_low']:.5f}")
+            if break_type == "close" and current_ltf_candle['ha_close'] < point_to_break:
+                signal = "ltf_bearish_confirm_choch" if ltf_structure == "uptrend" or ltf_structure == "ranging" else "ltf_bearish_confirm_bos"
+                if DEBUG_STRATEGY_LOGIC: print(f"        >>> LTF BEARISH CONFIRM by CLOSE ({signal})!")
+                return signal, point_to_break, current_ltf_time
+            elif break_type == "wick" and current_ltf_candle['ha_low'] < point_to_break:
+                signal = "ltf_bearish_confirm_choch" if ltf_structure == "uptrend" or ltf_structure == "ranging" else "ltf_bearish_confirm_bos"
+                if DEBUG_STRATEGY_LOGIC: print(f"        >>> LTF BEARISH CONFIRM by WICK ({signal})!")
+                return signal, point_to_break, current_ltf_time
+                
+    return None, None, None
+
+
+# --- Example Usage / Test Section ---
+if __name__ == '__main__':
+    print("Testing strategy_logic.py...")
+    # We need sample data with swings to test this properly.
+    # Let's use the data fetching from previous steps.
+    from data_handler import fetch_historical_data, shutdown_mt5_connection
+    from utils import identify_swing_points
+    from heikin_ashi import calculate_heikin_ashi
+    import config # To get timeframe constants and other params
+
+    symbol_to_test = config.SYMBOLS[0]
+    # Use a slightly longer range to ensure enough swings for structure
+    start_date_test = "2025-02-01" 
+    end_date_test = "2025-02-28" # One month
+
+    print(f"\nFetching HTF data for {symbol_to_test} for structure analysis...")
+    htf_data = fetch_historical_data(symbol_to_test, config.HTF_MT5, start_date_test, end_date_test)
+    
+    if htf_data is not None and not htf_data.empty:
+        htf_data_with_swings = identify_swing_points(
+            htf_data, 
+            config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF, 
+            config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF
+        )
+        print(f"HTF data with swings (shape): {htf_data_with_swings.shape}")
+
+        # Test get_market_structure_and_recent_swings
+        # Test on a few points in the data
+        if len(htf_data_with_swings) > config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF * 2 + 10: # Ensure enough data
+            test_indices = [
+                len(htf_data_with_swings) // 2, # Middle
+                len(htf_data_with_swings) - config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF - 2 # Near end
+            ]
+            for idx_loc in test_indices:
+                print(f"\n--- Testing structure at HTF index (iloc): {idx_loc} (Time: {htf_data_with_swings.index[idx_loc]}) ---")
+                structure, sh_p, sh_t, sl_p, sl_t = get_market_structure_and_recent_swings(
+                    htf_data_with_swings.iloc[:idx_loc+1] # Pass data up to that point
+                )
+                print(f"Market Structure: {structure}")
+                print(f"Last SH: {sh_p} at {sh_t}, Last SL: {sl_p} at {sl_t}")
+
+                # Test CHoCH detection (this is a conceptual test, real CHoCH needs prior trend)
+                choch_type, choch_price, choch_time = detect_choch(
+                    htf_data_with_swings, # Pass full df with pre-calculated swings
+                    idx_loc,              # Current candle to check if it *causes* a CHoCH
+                    config.BREAK_TYPE
+                )
+                if choch_type:
+                    print(f"CHoCH Detected at current candle: {choch_type} breaking level {choch_price} at {choch_time}")
+                else:
+                    print("No CHoCH detected by current candle.")
+        else:
+            print("Not enough HTF data to run detailed structure tests.")
+            
+        # --- Test LTF Logic (conceptual, as we don't have a live HTF CHoCH signal here) ---
+        print(f"\nFetching LTF data for {symbol_to_test} for LTF structure analysis...")
+        ltf_data = fetch_historical_data(symbol_to_test, config.LTF_MT5, start_date_test, end_date_test)
+        if ltf_data is not None and not ltf_data.empty:
+            ltf_ha_data = calculate_heikin_ashi(ltf_data)
+            ltf_ha_with_swings = identify_swing_points(
+                ltf_ha_data,
+                config.N_BARS_LEFT_RIGHT_FOR_SWING_LTF,
+                config.N_BARS_LEFT_RIGHT_FOR_SWING_LTF,
+                col_high='ha_high', col_low='ha_low'
+            )
+            print(f"LTF HA data with swings (shape): {ltf_ha_with_swings.shape}")
+
+            if len(ltf_ha_with_swings) > config.N_BARS_LEFT_RIGHT_FOR_SWING_LTF * 2 + 20:
+                ltf_test_idx = len(ltf_ha_with_swings) // 2
+                print(f"\n--- Testing LTF structure at LTF HA index (iloc): {ltf_test_idx} (Time: {ltf_ha_with_swings.index[ltf_test_idx]}) ---")
+                
+                # Simulate a required bullish direction
+                ltf_signal, ltf_price, ltf_time = detect_ltf_structure_change(
+                    ltf_ha_with_swings, ltf_test_idx, "bullish", config.BREAK_TYPE
+                )
+                if ltf_signal:
+                    print(f"LTF Bullish Confirm: {ltf_signal} at level {ltf_price} at {ltf_time}")
+                else:
+                    print("No LTF Bullish Confirm at current LTF candle.")
+
+                # Simulate a required bearish direction
+                ltf_signal_b, ltf_price_b, ltf_time_b = detect_ltf_structure_change(
+                    ltf_ha_with_swings, ltf_test_idx, "bearish", config.BREAK_TYPE
+                )
+                if ltf_signal_b:
+                    print(f"LTF Bearish Confirm: {ltf_signal_b} at level {ltf_price_b} at {ltf_time_b}")
+                else:
+                    print("No LTF Bearish Confirm at current LTF candle.")
+            else:
+                print("Not enough LTF HA data for detailed tests.")
+        else:
+            print("Failed to fetch LTF data for testing.")
+    else:
+        print("Failed to fetch HTF data for testing.")
+
+    shutdown_mt5_connection()
+    print("\nstrategy_logic.py test finished.")
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\utils.py
+
+# forex_backtester_cli/utils.py
+import pandas as pd
+import numpy as np
+
+def identify_swing_points_simple(df: pd.DataFrame, n_left: int, n_right: int, 
+                                 col_high: str = 'high', col_low: str = 'low') -> pd.DataFrame:
+    """
+    Identifies swing highs and swing lows using a simple n-bars left/right comparison.
+    (This is your original function, renamed for clarity)
+    """
+    df_out = df.copy()
+    df_out['swing_high'] = np.nan
+    df_out['swing_low'] = np.nan
+
+    # Ensure columns exist
+    if col_high not in df_out.columns or col_low not in df_out.columns:
+        raise ValueError(f"Columns '{col_high}' or '{col_low}' not found in DataFrame.")
+
+    for i in range(n_left, len(df_out) - n_right):
+        # Check for Swing High
+        is_swing_high = True
+        current_high = df_out.loc[df_out.index[i], col_high]
+        for j in range(1, n_left + 1):
+            if df_out.loc[df_out.index[i-j], col_high] >= current_high:
+                is_swing_high = False
+                break
+        if not is_swing_high:
+            continue
+        for j in range(1, n_right + 1):
+            if df_out.loc[df_out.index[i+j], col_high] > current_high: # Strictly higher on the right
+                is_swing_high = False
+                break
+        if is_swing_high:
+            df_out.loc[df_out.index[i], 'swing_high'] = current_high
+
+        # Check for Swing Low
+        is_swing_low = True
+        current_low = df_out.loc[df_out.index[i], col_low]
+        for j in range(1, n_left + 1):
+            if df_out.loc[df_out.index[i-j], col_low] <= current_low:
+                is_swing_low = False
+                break
+        if not is_swing_low:
+            continue
+        for j in range(1, n_right + 1):
+            if df_out.loc[df_out.index[i+j], col_low] < current_low: # Strictly lower on the right
+                is_swing_low = False
+                break
+        if is_swing_low:
+            df_out.loc[df_out.index[i], 'swing_low'] = current_low
+            
+    return df_out
+
+
+def identify_swing_points_zigzag(df: pd.DataFrame, zigzag_len: int,
+                                 col_high: str = 'high', col_low: str = 'low') -> pd.DataFrame:
+    """
+    Identifies swing highs and swing lows using a ZigZag-like logic.
+    A swing point is confirmed after the trend changes direction.
+
+    Args:
+        df (pd.DataFrame): Input DataFrame with high and low columns.
+        zigzag_len (int): The number of bars to look back for highest high / lowest low
+                           to determine potential trend changes.
+        col_high (str): Name of the high column.
+        col_low (str): Name of the low column.
+
+    Returns:
+        pd.DataFrame: Original DataFrame with 'swing_high' and 'swing_low' columns.
+                      These columns will contain the price of the swing point or NaN.
+    """
+    if not all(c in df.columns for c in [col_high, col_low]):
+        raise ValueError(f"DataFrame must contain '{col_high}' and '{col_low}' columns.")
+    if zigzag_len < 2:
+        raise ValueError("zigzag_len must be at least 2.")
+
+    df_out = df.copy()
+    df_out['swing_high'] = np.nan
+    df_out['swing_low'] = np.nan
+
+    trend = 0 # 0: undetermined, 1: up, -1: down
+    last_pivot_idx = 0 
+    last_pivot_price = 0.0
+    
+    # Temporary lists to store potential pivots before confirmation
+    pivots_high_price = []
+    pivots_high_idx = []
+    pivots_low_price = []
+    pivots_low_idx = []
+
+    for i in range(len(df_out)):
+        current_high = df_out.loc[df_out.index[i], col_high]
+        current_low = df_out.loc[df_out.index[i], col_low]
+
+        # Determine rolling highest high and lowest low
+        # Ensure we don't go out of bounds at the start
+        lookback_period = df_out.iloc[max(0, i - zigzag_len + 1) : i + 1]
+        highest_in_len = lookback_period[col_high].max()
+        lowest_in_len = lookback_period[col_low].min()
+
+        new_trend = trend
+
+        if trend == 0: # Initial trend determination
+            if current_high == highest_in_len:
+                new_trend = 1 # Tentatively up
+                last_pivot_idx = i
+                last_pivot_price = current_low # If trend starts up, the last pivot was a low
+            elif current_low == lowest_in_len:
+                new_trend = -1 # Tentatively down
+                last_pivot_idx = i
+                last_pivot_price = current_high # If trend starts down, the last pivot was a high
+        
+        elif trend == 1: # Was uptrend
+            if current_low == lowest_in_len and i > last_pivot_idx: # Potential reversal down
+                # The previous high (highest since last_pivot_idx) is confirmed as a swing high
+                confirmed_sh_period = df_out.iloc[last_pivot_idx : i] # Don't include current bar i
+                if not confirmed_sh_period.empty:
+                    confirmed_sh_price = confirmed_sh_period[col_high].max()
+                    confirmed_sh_idx_offset = confirmed_sh_period[col_high].idxmax()
+                    # df_out.loc[confirmed_sh_idx_offset, 'swing_high'] = confirmed_sh_price
+                    pivots_high_price.append(confirmed_sh_price)
+                    pivots_high_idx.append(confirmed_sh_idx_offset)
+
+                new_trend = -1
+                last_pivot_idx = i # Current bar's index is start of new potential leg
+                last_pivot_price = current_high # The high of this bar is the reference for the new down leg
+        
+        elif trend == -1: # Was downtrend
+            if current_high == highest_in_len and i > last_pivot_idx: # Potential reversal up
+                # The previous low (lowest since last_pivot_idx) is confirmed as a swing low
+                confirmed_sl_period = df_out.iloc[last_pivot_idx : i] # Don't include current bar i
+                if not confirmed_sl_period.empty:
+                    confirmed_sl_price = confirmed_sl_period[col_low].min()
+                    confirmed_sl_idx_offset = confirmed_sl_period[col_low].idxmin()
+                    # df_out.loc[confirmed_sl_idx_offset, 'swing_low'] = confirmed_sl_price
+                    pivots_low_price.append(confirmed_sl_price)
+                    pivots_low_idx.append(confirmed_sl_idx_offset)
+                
+                new_trend = 1
+                last_pivot_idx = i # Current bar's index is start of new potential leg
+                last_pivot_price = current_low # The low of this bar is the reference for the new up leg
+        
+        trend = new_trend
+
+    # After iterating, populate the swing_high and swing_low columns
+    if pivots_high_idx:
+        df_out.loc[pivots_high_idx, 'swing_high'] = pivots_high_price
+    if pivots_low_idx:
+        df_out.loc[pivots_low_idx, 'swing_low'] = pivots_low_price
+        
+    # Post-processing: Remove consecutive swings of the same type
+    # e.g., if two swing highs are identified without an intervening swing low.
+    # This requires iterating through the identified pivots.
+    # For now, this basic version might produce some redundant swings if zigzag_len is small.
+    # A more robust ZigZag would ensure alternating pivots.
+
+    # A simple way to ensure alternating pivots:
+    all_pivots = []
+    for idx, price in zip(pivots_high_idx, pivots_high_price):
+        all_pivots.append({'time': idx, 'price': price, 'type': 'high'})
+    for idx, price in zip(pivots_low_idx, pivots_low_price):
+        all_pivots.append({'time': idx, 'price': price, 'type': 'low'})
+    
+    if not all_pivots:
+        return df_out
+
+    all_pivots_df = pd.DataFrame(all_pivots).set_index('time').sort_index()
+    
+    df_out['swing_high'] = np.nan # Reset
+    df_out['swing_low'] = np.nan  # Reset
+
+    last_pivot_type = None
+    for time_idx, row in all_pivots_df.iterrows():
+        current_pivot_type = row['type']
+        current_pivot_price = row['price']
+        
+        if last_pivot_type is None or current_pivot_type != last_pivot_type:
+            if current_pivot_type == 'high':
+                df_out.loc[time_idx, 'swing_high'] = current_pivot_price
+            else: # low
+                df_out.loc[time_idx, 'swing_low'] = current_pivot_price
+            last_pivot_type = current_pivot_type
+        else: # Same type as last, means we need to take the more extreme one
+            if current_pivot_type == 'high' and current_pivot_price > df_out.loc[df_out['swing_high'].last_valid_index(), 'swing_high']:
+                 df_out.loc[df_out['swing_high'].last_valid_index(), 'swing_high'] = np.nan # Remove previous less extreme
+                 df_out.loc[time_idx, 'swing_high'] = current_pivot_price
+            elif current_pivot_type == 'low' and current_pivot_price < df_out.loc[df_out['swing_low'].last_valid_index(), 'swing_low']:
+                 df_out.loc[df_out['swing_low'].last_valid_index(), 'swing_low'] = np.nan # Remove previous less extreme
+                 df_out.loc[time_idx, 'swing_low'] = current_pivot_price
+
+
+    return df_out
+
+
+# Example usage
+if __name__ == '__main__':
+    from data_handler import fetch_historical_data, shutdown_mt5_connection, initialize_mt5_connection
+    from config import SYMBOLS, HTF_MT5, START_DATE_STR, END_DATE_STR
+    import config # To get N_BARS_LEFT_RIGHT_FOR_SWING_HTF
+    import matplotlib.pyplot as plt
+
+    print("Testing utils.py - identify_swing_points...")
+    
+    # --- Test Simple Swings ---
+    # print("\n--- Testing Simple Swing Identification ---")
+    # if initialize_mt5_connection():
+    #     htf_ohlc_data_simple = fetch_historical_data(SYMBOLS[0], HTF_MT5, START_DATE_STR, "2025-02-10")
+    #     if htf_ohlc_data_simple is not None and not htf_ohlc_data_simple.empty:
+    #         htf_data_with_simple_swings = identify_swing_points_simple(
+    #             htf_ohlc_data_simple.copy(), 
+    #             config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF, 
+    #             config.N_BARS_LEFT_RIGHT_FOR_SWING_HTF
+    #         )
+    #         print(htf_data_with_simple_swings[htf_data_with_simple_swings['swing_high'].notna() | htf_data_with_simple_swings['swing_low'].notna()].head(10))
+    #     else:
+    #         print(f"Could not fetch data for simple swing points test.")
+    #     shutdown_mt5_connection()
+
+
+    # --- Test ZigZag Swings ---
+    print("\n--- Testing ZigZag Swing Identification ---")
+    zigzag_param = 9 # Corresponds to zigzag_len in PineScript
+    if initialize_mt5_connection():
+        htf_ohlc_data_zigzag = fetch_historical_data(SYMBOLS[0], HTF_MT5, START_DATE_STR, "2025-02-28") # Longer period for zigzag
+        if htf_ohlc_data_zigzag is not None and not htf_ohlc_data_zigzag.empty:
+            htf_data_with_zigzag_swings = identify_swing_points_zigzag(
+                htf_ohlc_data_zigzag.copy(), 
+                zigzag_len=zigzag_param
+            )
+            print("\nHTF Data with ZigZag Swing Points (showing only rows with swings):")
+            print(htf_data_with_zigzag_swings[htf_data_with_zigzag_swings['swing_high'].notna() | htf_data_with_zigzag_swings['swing_low'].notna()].head(20))
+
+            # Optional: Plotting to visualize
+            plt.figure(figsize=(15, 7))
+            plt.plot(htf_data_with_zigzag_swings.index, htf_data_with_zigzag_swings['close'], label='Close Price', alpha=0.5, zorder=1)
+            
+            # Plot identified swings
+            swing_highs_plot = htf_data_with_zigzag_swings[htf_data_with_zigzag_swings['swing_high'].notna()]
+            swing_lows_plot = htf_data_with_zigzag_swings[htf_data_with_zigzag_swings['swing_low'].notna()]
+            
+            plt.scatter(swing_highs_plot.index, swing_highs_plot['swing_high'], color='red', marker='v', s=100, label='ZigZag High', zorder=5)
+            plt.scatter(swing_lows_plot.index, swing_lows_plot['swing_low'], color='lime', marker='^', s=100, label='ZigZag Low', zorder=5)
+
+            # Draw ZigZag lines
+            all_pivots_plot = pd.concat([
+                swing_highs_plot[['swing_high']].rename(columns={'swing_high': 'price'}),
+                swing_lows_plot[['swing_low']].rename(columns={'swing_low': 'price'})
+            ]).sort_index().dropna()
+
+            if len(all_pivots_plot) > 1:
+                 plt.plot(all_pivots_plot.index, all_pivots_plot['price'], color='blue', linestyle='-', marker='o', markersize=3, linewidth=1.5, label='ZigZag Line', zorder=3)
+
+
+            plt.title(f"{SYMBOLS[0]} {config.HTF_TIMEFRAME_STR} ZigZag Swings (len={zigzag_param})")
+            plt.legend()
+            plt.show()
+        else:
+            print(f"Could not fetch data for ZigZag swing points test.")
+        shutdown_mt5_connection()
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\junk\plotly_trial.py
+
+# test_plotly_export.py
+import plotly.graph_objects as go
+import plotly
+import os
+
+print("Attempting to create a simple Plotly figure...")
+fig = go.Figure(data=[go.Scatter(x=[1, 2, 3], y=[4, 1, 2])])
+output_path = "test_plotly_fig.html"
+
+print(f"Attempting to save figure to {output_path} using pio.write_image...")
+try:
+    # Using the explicit pio.write_image as per docs
+    plotly.offline.plot(fig, filename='canada_offline.html') 
+    print(f"Figure saved successfully to {output_path}!")
+    if os.path.exists(output_path):
+        print("File exists.")
+    else:
+        print("File was NOT created despite no error.")
+except Exception as e:
+    print(f"Error during pio.write_image: {e}")
+    if "kaleido" in str(e).lower() or "command not found" in str(e).lower() or "failed to start" in str(e).lower():
+        print("This strongly suggests a Kaleido installation or PATH issue.")
+        print("Please ensure Kaleido is installed correctly in your 'trading_env' environment.")
+        print("Try: pip install kaleido")
+        print("Or: conda install -c conda-forge python-kaleido")
+    elif "timeout" in str(e).lower():
+        print("Kaleido process timed out. This can happen with complex figures or resource issues, but unlikely for this simple test.")
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\strategies\base_strategy.py
+
+# forex_backtester_cli/strategies/base_strategy.py
+from abc import ABC, abstractmethod
+import pandas as pd
+
+class BaseStrategy(ABC):
+    """
+    Abstract base class for all trading strategies.
+    """
+    def __init__(self, strategy_params: dict, common_params: dict):
+        """
+        Args:
+            strategy_params (dict): Parameters specific to this strategy instance.
+            common_params (dict): Common parameters like symbol, pip_size, etc.
+        """
+        self.params = strategy_params
+        self.common_params = common_params
+        self.symbol = common_params.get("symbol", "UNKNOWN")
+        self.pip_size = common_params.get("pip_size", 0.0001) # Default, should be set
+        self.sl_buffer_price = common_params.get("sl_buffer_price", 0.0)
+
+        # R-levels to track, can be overridden by strategy_params
+        self.r_levels_to_track = strategy_params.get("r_levels_to_track", [1.0, 1.5, 2.0, 2.5, 3.0])
+
+
+    @abstractmethod
+    def prepare_data(self, htf_data: pd.DataFrame, ltf_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Prepare HTF and LTF data specific to the strategy's needs.
+        This might involve calculating indicators, identifying specific swing types, etc.
+        It should return the prepared HTF and LTF DataFrames.
+        The input dataframes are raw OHLC.
+        Swing points and HA might be calculated here or passed in already prepared.
+        For simplicity, let's assume swing points and HA are pre-calculated and passed
+        to check_entry_signal. This method can add strategy-specific indicators.
+
+        Returns:
+            tuple: (prepared_htf_df, prepared_ltf_df)
+        """
+        pass
+
+    @abstractmethod
+    def check_htf_condition(self, htf_data_prepared: pd.DataFrame, current_htf_candle_idx: int) -> dict | None:
+        """
+        Checks if the Higher Timeframe condition for a potential setup is met.
+
+        Args:
+            htf_data_prepared (pd.DataFrame): HTF data, potentially with strategy-specific indicators and swings.
+            current_htf_candle_idx (int): Index of the current HTF candle being evaluated.
+
+        Returns:
+            dict | None: A dictionary with HTF signal details (e.g., {'type': 'bullish_choch', 'level': 1.2345, 'time': timestamp}) 
+                         if condition met, else None.
+        """
+        pass
+
+    @abstractmethod
+    def check_ltf_entry_signal(self, ltf_data_prepared: pd.DataFrame, current_ltf_candle_idx: int, htf_signal_details: dict) -> dict | None:
+        """
+        Checks for the Lower Timeframe entry confirmation signal, given an HTF condition.
+
+        Args:
+            ltf_data_prepared (pd.DataFrame): LTF data (e.g., Heikin Ashi with swings).
+            current_ltf_candle_idx (int): Index of the current LTF candle.
+            htf_signal_details (dict): Information from the HTF signal.
+
+        Returns:
+            dict | None: A dictionary with LTF entry signal details (e.g., {'type': 'ltf_bullish_bos', 'break_level': 1.1223, 'confirmed_time': timestamp})
+                         if entry signal met, else None.
+        """
+        pass
+
+    @abstractmethod
+    def calculate_sl_tp(self, entry_price: float, entry_time: pd.Timestamp, 
+                        ltf_data_prepared: pd.DataFrame, ltf_signal_details: dict, 
+                        htf_signal_details: dict) -> tuple[float, float]:
+        """
+        Calculates Stop Loss and Take Profit levels for a trade.
+
+        Args:
+            entry_price (float): The entry price of the trade.
+            entry_time (pd.Timestamp): The entry time of the trade.
+            ltf_data_prepared (pd.DataFrame): LTF data around the entry.
+            ltf_signal_details (dict): Details from the LTF entry signal.
+            htf_signal_details (dict): Details from the HTF condition.
+
+
+        Returns:
+            tuple: (sl_price, tp_price)
+        """
+        pass
+    
+    def get_r_levels_to_track(self) -> list:
+        """Returns the R-levels this strategy wants to track."""
+        return self.r_levels_to_track
+
+    # Optional: Method for custom trade management logic during an open trade
+    # def manage_open_trade(self, trade_info: dict, current_ltf_candle: pd.Series) -> dict | None:
+    #     """
+    #     Allows for custom trade management (e.g., trailing stops, partial closes).
+    #     Args:
+    #         trade_info (dict): The current active trade's dictionary.
+    #         current_ltf_candle (pd.Series): The current LTF OHLC candle.
+    #     Returns:
+    #         dict | None: Updated trade_info if action taken (e.g., new SL), or None.
+    #                      Or a signal to close the trade: {'action': 'close', 'price': ...}
+    #     """
+    #     return None
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\strategies\choch_ha_sma_strategy.py
+
+# forex_backtester_cli/strategies/choch_ha_sma_strategy.py
+import pandas as pd
+import numpy as np
+from .base_strategy import BaseStrategy
+from strategy_logic import detect_choch as original_detect_choch # For HTF CHoCH
+# We'll need access to config for some default params if not in strategy_params
+import config 
+
+class ChochHaSmaStrategy(BaseStrategy):
+    def __init__(self, strategy_params: dict, common_params: dict):
+        super().__init__(strategy_params, common_params)
+        # Strategy-specific parameters
+        self.sma_period = self.params.get("SMA_PERIOD", 9)
+        self.sl_fixed_pips = self.params.get("SL_FIXED_PIPS", 10)
+        self.sl_ha_swing_candles = self.params.get("SL_HA_SWING_CANDLES", 5)
+        self.tp_rr_ratio = self.params.get("TP_RR_RATIO", 1.5) # Default if not in params
+        # BREAK_TYPE for HTF CHoCH can also be a param if needed, else use common
+        self.htf_break_type = self.params.get("HTF_BREAK_TYPE", config.BREAK_TYPE) 
+
+        # Ensure R-levels are correctly fetched or defaulted
+        self.r_levels_to_track = self.params.get("R_LEVELS_TO_TRACK", [1.0, 1.5, 2.0, 2.5, 3.0])
+
+
+    def prepare_data(self, htf_data_with_swings: pd.DataFrame, ltf_data_ha_with_swings: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        HTF data already has swings.
+        LTF HA data already has HA candles and swings.
+        This strategy needs to add the 9 SMA to the LTF HA data.
+        """
+        if 'ha_close' not in ltf_data_ha_with_swings.columns:
+            raise ValueError("LTF data must have 'ha_close' for SMA calculation (Heikin Ashi expected).")
+        
+        # Calculate SMA on HA_Close for the LTF data
+        ltf_data_ha_with_swings[f'sma_{self.sma_period}'] = ltf_data_ha_with_swings['ha_close'].rolling(window=self.sma_period).mean()
+        
+        return htf_data_with_swings, ltf_data_ha_with_swings
+
+    def check_htf_condition(self, htf_data_prepared: pd.DataFrame, current_htf_candle_idx: int) -> dict | None:
+        """
+        Uses the existing CHoCH detection logic for the HTF.
+        htf_data_prepared is assumed to be htf_data_with_swings.
+        """
+        choch_type, choch_price_broken, choch_confirmed_time = original_detect_choch(
+            htf_data_prepared, # This df already has swings
+            current_htf_candle_idx,
+            self.htf_break_type 
+        )
+        if choch_type:
+            return {
+                "type": choch_type, 
+                "level_broken": choch_price_broken,
+                "confirmed_time": choch_confirmed_time,
+                "required_ltf_direction": "bullish" if "bullish" in choch_type else "bearish"
+            }
+        return None
+
+    def check_ltf_entry_signal(self, ltf_data_prepared: pd.DataFrame, current_ltf_candle_idx: int, htf_signal_details: dict) -> dict | None:
+        """
+        Checks for the HA candle / SMA crossover signal on LTF.
+        ltf_data_prepared is assumed to be ltf_data_ha_with_swings_and_sma.
+        """
+        if current_ltf_candle_idx < 1: # Need previous candle for SMA
+            return None
+
+        signal_candle = ltf_data_prepared.iloc[current_ltf_candle_idx]
+        sma_value = signal_candle.get(f'sma_{self.sma_period}')
+
+        if pd.isna(sma_value): # SMA not yet calculated for early bars
+            return None
+
+        required_direction = htf_signal_details["required_ltf_direction"]
+        
+        ha_open = signal_candle['ha_open']
+        ha_close = signal_candle['ha_close']
+        # ha_high = signal_candle['ha_high'] # Not directly used for entry signal logic
+        # ha_low = signal_candle['ha_low']   # Not directly used for entry signal logic
+
+        entry_signal_type = None
+
+        if required_direction == "bullish":
+            # HA Green: ha_close > ha_open
+            # HA Open below SMA: ha_open < sma_value
+            # HA Close above SMA: ha_close > sma_value
+            if ha_close > ha_open and ha_open < sma_value and ha_close > sma_value:
+                entry_signal_type = "ltf_bullish_ha_sma_cross"
+        
+        elif required_direction == "bearish":
+            # HA Red: ha_close < ha_open
+            # HA Open above SMA: ha_open > sma_value
+            # HA Close below SMA: ha_close < sma_value
+            if ha_close < ha_open and ha_open > sma_value and ha_close < sma_value:
+                entry_signal_type = "ltf_bearish_ha_sma_cross"
+
+        if entry_signal_type:
+            return {
+                "type": entry_signal_type,
+                "confirmed_time": signal_candle.name, # Time of the signal HA candle
+                "signal_candle_details": { # Store for SL calculation if needed
+                    "ha_high": signal_candle['ha_high'],
+                    "ha_low": signal_candle['ha_low'],
+                }
+            }
+        return None
+
+    def calculate_sl_tp(self, entry_price: float, entry_time: pd.Timestamp, 
+                        ltf_data_prepared: pd.DataFrame, # This is ltf_data_ha_with_swings_and_sma
+                        ltf_signal_details: dict, 
+                        htf_signal_details: dict) -> tuple[float | None, float | None]:
+        
+        direction = htf_signal_details["required_ltf_direction"]
+        
+        # SL Condition 1: Fixed pips
+        sl_fixed_level = None
+        if direction == "bullish":
+            sl_fixed_level = entry_price - (self.sl_fixed_pips * self.pip_size)
+        elif direction == "bearish":
+            sl_fixed_level = entry_price + (self.sl_fixed_pips * self.pip_size)
+
+        # SL Condition 2: Recent HA Swing (5 candles *before* entry candle)
+        # Entry candle is the one *after* the signal candle.
+        # Signal candle time is ltf_signal_details['confirmed_time']
+        signal_candle_time = ltf_signal_details['confirmed_time']
+        
+        # Get the 5 HA candles ending at the signal candle
+        # (signal candle is index 0, then -1, -2, -3, -4 relative to signal candle)
+        try:
+            signal_candle_idx_loc = ltf_data_prepared.index.get_loc(signal_candle_time)
+        except KeyError:
+            print(f"    Warning: Signal candle time {signal_candle_time} not found in LTF data for SL calc. Using fixed SL only.")
+            sl_ha_swing_level = sl_fixed_level # Fallback
+        else:
+            start_idx_for_ha_swing = max(0, signal_candle_idx_loc - self.sl_ha_swing_candles + 1)
+            # Ensure we don't go beyond the signal candle itself for this window
+            ha_candles_for_sl = ltf_data_prepared.iloc[start_idx_for_ha_swing : signal_candle_idx_loc + 1]
+
+            sl_ha_swing_level = None
+            if not ha_candles_for_sl.empty:
+                if direction == "bullish":
+                    lowest_ha_low = ha_candles_for_sl['ha_low'].min()
+                    sl_ha_swing_level = lowest_ha_low - self.sl_buffer_price
+                elif direction == "bearish":
+                    highest_ha_high = ha_candles_for_sl['ha_high'].max()
+                    sl_ha_swing_level = highest_ha_high + self.sl_buffer_price
+            else: # Should not happen if signal_candle_idx_loc is valid
+                sl_ha_swing_level = sl_fixed_level # Fallback
+
+        # Determine final SL: "whichever is near to Entry"
+        # For long: nearer means higher SL value (smaller risk). max()
+        # For short: nearer means lower SL value (smaller risk). min()
+        final_sl_price = None
+        if direction == "bullish":
+            if sl_fixed_level is not None and sl_ha_swing_level is not None:
+                final_sl_price = max(sl_fixed_level, sl_ha_swing_level)
+            elif sl_fixed_level is not None:
+                final_sl_price = sl_fixed_level
+            else: # Should only be sl_ha_swing_level if sl_fixed_level was None (not possible with current logic)
+                final_sl_price = sl_ha_swing_level 
+        elif direction == "bearish":
+            if sl_fixed_level is not None and sl_ha_swing_level is not None:
+                final_sl_price = min(sl_fixed_level, sl_ha_swing_level)
+            elif sl_fixed_level is not None:
+                final_sl_price = sl_fixed_level
+            else:
+                final_sl_price = sl_ha_swing_level
+
+        if final_sl_price is None:
+            print(f"    ERROR: Could not determine final SL price for trade at {entry_time}. Skipping.")
+            return None, None
+
+        # Calculate TP
+        risk_amount_price = abs(entry_price - final_sl_price)
+        if risk_amount_price < self.pip_size: # Avoid tiny/zero risk
+            print(f"    Warning: Risk amount too small ({risk_amount_price:.5f}) for {self.symbol} at {entry_time}. Cannot set valid TP.")
+            return final_sl_price, None # Return SL, but no TP
+
+        tp_price = None
+        if direction == "bullish":
+            tp_price = entry_price + (risk_amount_price * self.tp_rr_ratio)
+        elif direction == "bearish":
+            tp_price = entry_price - (risk_amount_price * self.tp_rr_ratio)
+            
+        return final_sl_price, tp_price
+
+    def get_r_levels_to_track(self) -> list:
+        # Ensure R-levels are correctly fetched or defaulted from strategy_params
+        return self.params.get("R_LEVELS_TO_TRACK", [1.0, 1.5, 2.0, 2.5, 3.0])
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\strategies\choch_ha_strategy.py
+
+# forex_backtester_cli/strategies/choch_ha_strategy.py
+import pandas as pd
+from .base_strategy import BaseStrategy
+# Import necessary functions from your existing strategy_logic or utils
+# For this example, we'll assume detect_choch and detect_ltf_structure_change
+# are adapted or their core logic is moved into this class's methods.
+# We also need get_market_structure_and_recent_swings.
+# For simplicity, let's assume these are now methods or called by methods here.
+
+# --- Re-import or redefine necessary helper functions from strategy_logic.py ---
+# It's cleaner to have these as part of the class or helper methods if they are specific.
+# For now, let's assume they are available (e.g., from a shared utils or strategy_helpers module)
+# Or, we can copy/paste and adapt them here.
+# For this example, I'll integrate parts of their logic directly.
+
+from strategy_logic import get_market_structure_and_recent_swings, detect_choch as original_detect_choch, detect_ltf_structure_change as original_detect_ltf_change
+
+class ChochHaStrategy(BaseStrategy):
+    def __init__(self, strategy_params: dict, common_params: dict):
+        super().__init__(strategy_params, common_params)
+        # Strategy-specific parameters from strategy_params
+        self.break_type = self.params.get("BREAK_TYPE", "close")
+        self.tp_rr_ratio = self.params.get("TP_RR_RATIO", 1.5)
+        # Swing identification parameters are now part of common_params or assumed to be on data
+        # self.htf_swing_len = self.params.get("ZIGZAG_LEN_HTF", 9) # Example
+        # self.ltf_swing_len = self.params.get("ZIGZAG_LEN_LTF", 5) # Example
+
+    def prepare_data(self, htf_data: pd.DataFrame, ltf_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        For this strategy, swing points and HA are assumed to be pre-calculated
+        by the main backtester script before calling strategy methods.
+        This method could add strategy-specific indicators if needed.
+        """
+        # If this strategy needed unique indicators, calculate them here.
+        # e.g., htf_data['EMA20'] = htf_data['close'].ewm(span=20, adjust=False).mean()
+        return htf_data, ltf_data # Return them as is if no further prep needed by this strategy
+
+    def check_htf_condition(self, htf_data_with_swings: pd.DataFrame, current_htf_candle_idx: int) -> dict | None:
+        choch_type, choch_price_broken, choch_confirmed_time = original_detect_choch(
+            htf_data_with_swings,
+            current_htf_candle_idx,
+            self.break_type
+        )
+        if choch_type:
+            return {
+                "type": choch_type, # e.g., "bullish_choch" or "bearish_choch"
+                "level_broken": choch_price_broken,
+                "confirmed_time": choch_confirmed_time,
+                "required_ltf_direction": "bullish" if "bullish" in choch_type else "bearish"
+            }
+        return None
+
+    def check_ltf_entry_signal(self, ltf_data_ha_with_swings: pd.DataFrame, current_ltf_candle_idx: int, htf_signal_details: dict) -> dict | None:
+        required_direction = htf_signal_details["required_ltf_direction"]
+        
+        ltf_signal_type, ltf_signal_price_broken, ltf_signal_confirmed_time = original_detect_ltf_change(
+            ltf_data_ha_with_swings,
+            current_ltf_candle_idx,
+            required_direction,
+            self.break_type
+        )
+        if ltf_signal_type:
+            return {
+                "type": ltf_signal_type, # e.g., "ltf_bullish_confirm_bos"
+                "level_broken": ltf_signal_price_broken,
+                "confirmed_time": ltf_signal_confirmed_time
+            }
+        return None
+
+    def calculate_sl_tp(self, entry_price: float, entry_time: pd.Timestamp, 
+                        ltf_data_ha_with_swings: pd.DataFrame, # Using HA swings for SL placement
+                        ltf_signal_details: dict, 
+                        htf_signal_details: dict) -> tuple[float | None, float | None]:
+        
+        sl_price = None
+        direction = htf_signal_details["required_ltf_direction"]
+
+        # Find the HA swing point *before* entry_time to base SL on
+        relevant_swings_for_sl = ltf_data_ha_with_swings[ltf_data_ha_with_swings.index < entry_time]
+
+        if direction == "bullish":
+            last_ha_swing_low_for_sl = relevant_swings_for_sl[relevant_swings_for_sl['swing_low'].notna()]
+            if not last_ha_swing_low_for_sl.empty:
+                sl_price = last_ha_swing_low_for_sl['swing_low'].iloc[-1] - self.sl_buffer_price
+            else: 
+                sl_price = entry_price - (15 * self.pip_size) # Default SL
+                print(f"    Warning: No prior LTF HA swing low for SL ({self.symbol}). Using default SL.")
+        
+        elif direction == "bearish":
+            last_ha_swing_high_for_sl = relevant_swings_for_sl[relevant_swings_for_sl['swing_high'].notna()]
+            if not last_ha_swing_high_for_sl.empty:
+                sl_price = last_ha_swing_high_for_sl['swing_high'].iloc[-1] + self.sl_buffer_price
+            else: 
+                sl_price = entry_price + (15 * self.pip_size) # Default SL
+                print(f"    Warning: No prior LTF HA swing high for SL ({self.symbol}). Using default SL.")
+
+        if sl_price is None: return None, None # Should not happen with fallbacks
+
+        risk_amount_price = abs(entry_price - sl_price)
+        if risk_amount_price < self.pip_size: # Avoid tiny/zero risk
+            print(f"    Warning: Risk amount too small ({risk_amount_price:.5f}) for {self.symbol}. Cannot set valid SL/TP.")
+            return None, None # Indicate invalid SL/TP
+
+        tp_price = None
+        if direction == "bullish":
+            tp_price = entry_price + (risk_amount_price * self.tp_rr_ratio)
+        elif direction == "bearish":
+            tp_price = entry_price - (risk_amount_price * self.tp_rr_ratio)
+            
+        return sl_price, tp_price
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\strategies\zlsma_with_filters_strategy.py
+
+# forex_backtester_cli/strategies/zlsma_with_filters_strategy.py
+import pandas as pd
+import numpy as np
+from .base_strategy import BaseStrategy
+from indicators import ( 
+    calculate_zlsma, 
+    calculate_range_filter_bands, 
+    calculate_adaptive_macd,
+    calculate_atr 
+)
+
+class ZLSMAWithFiltersStrategy(BaseStrategy):
+    def __init__(self, strategy_params: dict, common_params: dict):
+        super().__init__(strategy_params, common_params)
+        self.zlsma_length = self.params.get("ZLSMA_LENGTH", 32)
+        self.zlsma_source_col = self.params.get("ZLSMA_SOURCE", 'close')
+        self.tp_rr_ratio = self.params.get("TP_RR_RATIO", 2.0)
+        self.sl_atr_period = self.params.get("SL_ATR_PERIOD", 14)
+        self.sl_atr_multiplier = self.params.get("SL_ATR_MULTIPLIER", 1.5)
+
+        self.use_range_filter = self.params.get("USE_RANGE_FILTER_HTF", False)
+        self.range_len = self.params.get("RANGE_FILTER_LENGTH", 20)
+        self.range_mult = self.params.get("RANGE_FILTER_MULT", 1.0)
+        self.range_atr_len = self.params.get("RANGE_FILTER_ATR_LEN", 100)
+
+        self.use_macd_filter = self.params.get("USE_ADAPTIVE_MACD_FILTER", False)
+        self.macd_r2_period = self.params.get("ADAPTIVE_MACD_R2_PERIOD", 20)
+        self.macd_fast = self.params.get("ADAPTIVE_MACD_FAST", 10)
+        self.macd_slow = self.params.get("ADAPTIVE_MACD_SLOW", 12) 
+        self.macd_signal = self.params.get("ADAPTIVE_MACD_SIGNAL", 9)
+
+    def prepare_data(self, htf_data: pd.DataFrame, ltf_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if self.use_range_filter:
+            htf_data['in_range'], htf_data['range_top'], htf_data['range_bottom'] = \
+                calculate_range_filter_bands(htf_data['close'], self.range_len, 
+                                             self.range_atr_len, self.range_mult,
+                                             htf_data['high'], htf_data['low'])
+        
+        if self.zlsma_source_col not in ltf_data.columns:
+            raise ValueError(f"Source column '{self.zlsma_source_col}' not in LTF data for ZLSMA.")
+        ltf_data['zlsma'] = calculate_zlsma(ltf_data[self.zlsma_source_col], self.zlsma_length)
+
+        if self.use_macd_filter:
+            ltf_data['macd_line'], ltf_data['macd_signal_line'], ltf_data['macd_hist'] = \
+                calculate_adaptive_macd(ltf_data['close'], self.macd_r2_period,
+                                        self.macd_fast, self.macd_slow, self.macd_signal)
+        ltf_data['atr_sl'] = calculate_atr(ltf_data['high'], ltf_data['low'], ltf_data['close'], self.sl_atr_period)
+        return htf_data, ltf_data
+
+    def check_htf_condition(self, htf_data_prepared: pd.DataFrame, current_htf_candle_idx: int) -> dict | None:
+        current_htf_candle = htf_data_prepared.iloc[current_htf_candle_idx]
+        
+        if self.use_range_filter:
+            # Ensure 'in_range' column exists if filter is enabled
+            if 'in_range' not in current_htf_candle.index:
+                # This case should ideally be handled in prepare_data or by ensuring column always exists
+                print(f"  WARNING ({self.symbol} HTF): 'in_range' column missing for range filter check at {current_htf_candle.name}")
+                # Decide behavior: proceed as if not in range, or block? Let's proceed cautiously.
+            elif pd.notna(current_htf_candle.get('in_range')) and current_htf_candle.get('in_range'):
+                return None 
+
+        # This HTF signal is a "go-ahead" if not filtered out.
+        # The actual direction will be determined by the LTF ZLSMA cross.
+        # 'level_broken' is not applicable here, so we don't include it or set to None.
+        return {
+            "type": "htf_conditions_met_for_zlsma", 
+            "time": current_htf_candle.name, 
+            "required_ltf_direction": "any", # LTF will determine actual direction
+            "level_broken": None # Explicitly None or omit
+        }
+
+    def check_ltf_entry_signal(self, ltf_data_prepared: pd.DataFrame, current_ltf_candle_idx: int, htf_signal_details: dict) -> dict | None:
+        if current_ltf_candle_idx < 1 or 'zlsma' not in ltf_data_prepared.columns:
+            return None
+
+        current_candle = ltf_data_prepared.iloc[current_ltf_candle_idx]
+        prev_candle = ltf_data_prepared.iloc[current_ltf_candle_idx - 1]
+
+        if pd.isna(current_candle['zlsma']) or pd.isna(prev_candle['zlsma']) or \
+           pd.isna(current_candle[self.zlsma_source_col]) or pd.isna(prev_candle[self.zlsma_source_col]):
+            return None 
+
+        is_bullish_cross = prev_candle[self.zlsma_source_col] < prev_candle['zlsma'] and \
+                           current_candle[self.zlsma_source_col] > current_candle['zlsma']
+        is_bearish_cross = prev_candle[self.zlsma_source_col] > prev_candle['zlsma'] and \
+                           current_candle[self.zlsma_source_col] < current_candle['zlsma']
+        
+        signal_to_return = None
+        trade_direction = None
+
+        if is_bullish_cross:
+            trade_direction = "bullish"
+            if self.use_macd_filter:
+                if 'macd_hist' not in current_candle.index or pd.isna(current_candle.get('macd_hist')):
+                    return None # MACD data not available
+                if current_candle.get('macd_hist') > 0:
+                    signal_to_return = {"type": "zlsma_bullish_cross_macd_confirm", "confirmed_time": current_candle.name, "direction": trade_direction}
+            else: 
+                signal_to_return = {"type": "zlsma_bullish_cross", "confirmed_time": current_candle.name, "direction": trade_direction}
+        
+        elif is_bearish_cross:
+            trade_direction = "bearish"
+            if self.use_macd_filter:
+                if 'macd_hist' not in current_candle.index or pd.isna(current_candle.get('macd_hist')):
+                    return None # MACD data not available
+                if current_candle.get('macd_hist') < 0:
+                    signal_to_return = {"type": "zlsma_bearish_cross_macd_confirm", "confirmed_time": current_candle.name, "direction": trade_direction}
+            else: 
+                signal_to_return = {"type": "zlsma_bearish_cross", "confirmed_time": current_candle.name, "direction": trade_direction}
+        
+        return signal_to_return
+
+    def calculate_sl_tp(self, entry_price: float, entry_time: pd.Timestamp, 
+                        ltf_data_prepared: pd.DataFrame, ltf_signal_details: dict, 
+                        htf_signal_details: dict) -> tuple[float | None, float | None]:
+        direction = ltf_signal_details["direction"]
+        atr_at_entry_candle_prev = np.nan
+        try:
+            entry_candle_prev_idx = ltf_data_prepared.index.get_loc(entry_time) -1
+            if entry_candle_prev_idx >= 0 and 'atr_sl' in ltf_data_prepared.columns:
+                 atr_at_entry_candle_prev = ltf_data_prepared['atr_sl'].iloc[entry_candle_prev_idx]
+            else:
+                raise IndexError("Not enough history for ATR or atr_sl column missing")
+
+            if pd.isna(atr_at_entry_candle_prev):
+                print(f"    Warning: ATR is NaN at {ltf_data_prepared.index[entry_candle_prev_idx]} for SL calc. Using default pip SL.")
+                atr_at_entry_candle_prev = self.pip_size * 20 
+        except (IndexError, KeyError) as e:
+             print(f"    Warning: Error getting ATR for SL/TP at {entry_time}: {e}. Using default pip SL.")
+             atr_at_entry_candle_prev = self.pip_size * 20 
+
+        sl_distance = atr_at_entry_candle_prev * self.sl_atr_multiplier
+        sl_price, tp_price = None, None
+
+        if direction == "bullish":
+            sl_price = entry_price - sl_distance
+            tp_price = entry_price + (sl_distance * self.tp_rr_ratio)
+        elif direction == "bearish":
+            sl_price = entry_price + sl_distance
+            tp_price = entry_price - (sl_distance * self.tp_rr_ratio)
+            
+        if sl_price is None or tp_price is None or sl_distance < self.pip_size / 2 : 
+            print(f"    Warning: Invalid SL/TP ({sl_price}, {tp_price}) or too small SL distance ({sl_distance}) for {self.symbol} at {entry_time}.")
+            return None, None 
+            
+        return sl_price, tp_price
+
+################################################################################
+
+### File: X:\AmalTrading\trading_backtesting\strategies\__init__.py
+
+# forex_backtester_cli/strategies/__init__.py
+
+from .choch_ha_strategy import ChochHaStrategy
+from .choch_ha_sma_strategy import ChochHaSmaStrategy
+from .zlsma_with_filters_strategy import ZLSMAWithFiltersStrategy
+
+STRATEGY_MAP = {
+    "ChochHa": ChochHaStrategy,
+    "ChochHaSma": ChochHaSmaStrategy,
+    "ZLSMAWithFilters": ZLSMAWithFiltersStrategy,
+}
+
+def get_strategy_class(strategy_name: str):
+    strategy_class = STRATEGY_MAP.get(strategy_name)
+    if strategy_class is None:
+        raise ValueError(f"Strategy '{strategy_name}' not found in STRATEGY_MAP.")
+    return strategy_class
+
+################################################################################
+

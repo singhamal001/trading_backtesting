@@ -1,11 +1,19 @@
+### File: X:\AmalTrading\trading_backtesting\strategies\__init__.py
+
 # forex_backtester_cli/strategies/__init__.py
 
 from .choch_ha_strategy import ChochHaStrategy
 from .choch_ha_sma_strategy import ChochHaSmaStrategy
+from .zlsma_with_filters_strategy import ZLSMAWithFiltersStrategy
+from .ha_alligator_macd_strategy import HAAlligatorMACDStrategy
+from .ha_adaptive_macd_strategy import HAAdaptiveMACDStrategy # New import
 
 STRATEGY_MAP = {
     "ChochHa": ChochHaStrategy,
-    "ChochHaSma": ChochHaSmaStrategy, # Add to map
+    "ChochHaSma": ChochHaSmaStrategy,
+    "ZLSMAWithFilters": ZLSMAWithFiltersStrategy,
+    "HAAlligatorMACD": HAAlligatorMACDStrategy, 
+    "HAAdaptiveMACD": HAAdaptiveMACDStrategy, # New strategy
 }
 
 def get_strategy_class(strategy_name: str):

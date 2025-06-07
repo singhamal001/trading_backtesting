@@ -1,4 +1,6 @@
 # forex_backtester_cli/strategies/choch_ha_strategy.py
+import config as global_config
+from strategy_logic import detect_choch as original_detect_choch, detect_ltf_structure_change as original_detect_ltf_change
 import pandas as pd
 from .base_strategy import BaseStrategy
 # Import necessary functions from your existing strategy_logic or utils
@@ -13,37 +15,26 @@ from .base_strategy import BaseStrategy
 # Or, we can copy/paste and adapt them here.
 # For this example, I'll integrate parts of their logic directly.
 
-from strategy_logic import get_market_structure_and_recent_swings, detect_choch as original_detect_choch, detect_ltf_structure_change as original_detect_ltf_change
-
 class ChochHaStrategy(BaseStrategy):
     def __init__(self, strategy_params: dict, common_params: dict):
         super().__init__(strategy_params, common_params)
-        # Strategy-specific parameters from strategy_params
-        self.break_type = self.params.get("BREAK_TYPE", "close")
+        self.break_type = self.params.get("BREAK_TYPE", global_config.BREAK_TYPE) # Use global if not specified
         self.tp_rr_ratio = self.params.get("TP_RR_RATIO", 1.5)
-        # Swing identification parameters are now part of common_params or assumed to be on data
-        # self.htf_swing_len = self.params.get("ZIGZAG_LEN_HTF", 9) # Example
-        # self.ltf_swing_len = self.params.get("ZIGZAG_LEN_LTF", 5) # Example
 
     def prepare_data(self, htf_data: pd.DataFrame, ltf_data: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-        """
-        For this strategy, swing points and HA are assumed to be pre-calculated
-        by the main backtester script before calling strategy methods.
-        This method could add strategy-specific indicators if needed.
-        """
-        # If this strategy needed unique indicators, calculate them here.
-        # e.g., htf_data['EMA20'] = htf_data['close'].ewm(span=20, adjust=False).mean()
-        return htf_data, ltf_data # Return them as is if no further prep needed by this strategy
+        return htf_data, ltf_data
 
     def check_htf_condition(self, htf_data_with_swings: pd.DataFrame, current_htf_candle_idx: int) -> dict | None:
+        # This strategy uses the global config.BREAK_TYPE for HTF CHoCH if not specified in params
+        # or its own self.break_type if it was set from params.
         choch_type, choch_price_broken, choch_confirmed_time = original_detect_choch(
             htf_data_with_swings,
             current_htf_candle_idx,
-            self.break_type
+            self.break_type 
         )
         if choch_type:
             return {
-                "type": choch_type, # e.g., "bullish_choch" or "bearish_choch"
+                "type": choch_type, 
                 "level_broken": choch_price_broken,
                 "confirmed_time": choch_confirmed_time,
                 "required_ltf_direction": "bullish" if "bullish" in choch_type else "bearish"
@@ -57,25 +48,29 @@ class ChochHaStrategy(BaseStrategy):
             ltf_data_ha_with_swings,
             current_ltf_candle_idx,
             required_direction,
-            self.break_type
+            self.break_type # Assuming LTF break type is same as HTF for this strategy
         )
         if ltf_signal_type:
+            # Ensure the LTF signal's inherent direction matches the required HTF direction
+            # (original_detect_ltf_change already does this by taking 'required_direction' as input)
             return {
-                "type": ltf_signal_type, # e.g., "ltf_bullish_confirm_bos"
+                "type": ltf_signal_type, 
                 "level_broken": ltf_signal_price_broken,
-                "confirmed_time": ltf_signal_confirmed_time
+                "confirmed_time": ltf_signal_confirmed_time,
+                "direction": required_direction # Add direction explicitly for clarity in backtester
             }
         return None
 
     def calculate_sl_tp(self, entry_price: float, entry_time: pd.Timestamp, 
-                        ltf_data_ha_with_swings: pd.DataFrame, # Using HA swings for SL placement
+                        ltf_data_ha_with_swings: pd.DataFrame, 
                         ltf_signal_details: dict, 
                         htf_signal_details: dict) -> tuple[float | None, float | None]:
         
         sl_price = None
-        direction = htf_signal_details["required_ltf_direction"]
+        # direction comes from htf_signal_details or ltf_signal_details, should be consistent
+        direction = ltf_signal_details.get("direction", htf_signal_details["required_ltf_direction"])
 
-        # Find the HA swing point *before* entry_time to base SL on
+
         relevant_swings_for_sl = ltf_data_ha_with_swings[ltf_data_ha_with_swings.index < entry_time]
 
         if direction == "bullish":
@@ -83,23 +78,24 @@ class ChochHaStrategy(BaseStrategy):
             if not last_ha_swing_low_for_sl.empty:
                 sl_price = last_ha_swing_low_for_sl['swing_low'].iloc[-1] - self.sl_buffer_price
             else: 
-                sl_price = entry_price - (15 * self.pip_size) # Default SL
-                print(f"    Warning: No prior LTF HA swing low for SL ({self.symbol}). Using default SL.")
+                # Fallback SL if no swing found (e.g. 15 pips, should be configurable)
+                sl_price = entry_price - (15 * self.pip_size) 
+                print(f"    Warning (ChochHa): No prior LTF HA swing low for SL ({self.symbol}). Using default pip SL.")
         
         elif direction == "bearish":
             last_ha_swing_high_for_sl = relevant_swings_for_sl[relevant_swings_for_sl['swing_high'].notna()]
             if not last_ha_swing_high_for_sl.empty:
                 sl_price = last_ha_swing_high_for_sl['swing_high'].iloc[-1] + self.sl_buffer_price
             else: 
-                sl_price = entry_price + (15 * self.pip_size) # Default SL
-                print(f"    Warning: No prior LTF HA swing high for SL ({self.symbol}). Using default SL.")
+                sl_price = entry_price + (15 * self.pip_size) 
+                print(f"    Warning (ChochHa): No prior LTF HA swing high for SL ({self.symbol}). Using default pip SL.")
 
-        if sl_price is None: return None, None # Should not happen with fallbacks
+        if sl_price is None: return None, None
 
         risk_amount_price = abs(entry_price - sl_price)
-        if risk_amount_price < self.pip_size: # Avoid tiny/zero risk
-            print(f"    Warning: Risk amount too small ({risk_amount_price:.5f}) for {self.symbol}. Cannot set valid SL/TP.")
-            return None, None # Indicate invalid SL/TP
+        if risk_amount_price < self.pip_size: 
+            print(f"    Warning (ChochHa): Risk amount too small ({risk_amount_price:.5f}) for {self.symbol}. Cannot set valid SL/TP.")
+            return None, None 
 
         tp_price = None
         if direction == "bullish":
