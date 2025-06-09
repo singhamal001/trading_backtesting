@@ -133,11 +133,11 @@ STRATEGY_SPECIFIC_PARAMS = {
         "R_LEVELS_TO_TRACK": [1.0, 1.5, 2.0, 2.5, 3.0],
         # Adaptive MACD params (can reuse from ZLSMA or define specific ones)
         "ADAPTIVE_MACD_R2_PERIOD": 20, 
-        "ADAPTIVE_MACD_FAST": 12,      # Standard MACD fast
-        "ADAPTIVE_MACD_SLOW": 26,      # Standard MACD slow
-        "ADAPTIVE_MACD_SIGNAL": 9,       # Standard MACD signal
-        "SL_HA_SIGNAL_CANDLE_BUFFER_PIPS": 2, # Buffer for SL below/above signal HA candle
-        "HTF_BREAK_TYPE": "close" # For HTF CHoCH detection
+        "ADAPTIVE_MACD_FAST": 12,
+        "ADAPTIVE_MACD_SLOW": 26,
+        "ADAPTIVE_MACD_SIGNAL": 9,
+        "SL_HA_SIGNAL_CANDLE_BUFFER_PIPS": 2,
+        "HTF_BREAK_TYPE": "close"
     }
 }
 

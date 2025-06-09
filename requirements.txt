@@ -1,0 +1,7 @@
+MetaTrader5
+numpy
+pandas
+python-dotenv
+requests
+scikit-learn
+scipy
