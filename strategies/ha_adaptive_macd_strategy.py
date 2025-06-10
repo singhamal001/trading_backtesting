@@ -117,38 +117,66 @@ class HAAdaptiveMACDStrategy(BaseStrategy):
     def calculate_sl_tp(self, entry_price: float, entry_time: pd.Timestamp, 
                         chart_data_prepared: pd.DataFrame, ltf_signal_details: dict, 
                         htf_signal_details: dict) -> tuple[float | None, float | None]:
-        direction = ltf_signal_details["direction"]
+        
+        print(f"    DEBUG SL/TP Calc for {self.symbol} at {entry_time}:")
+        print(f"      Entry Price: {entry_price:.5f}")
+        print(f"      LTF Signal Details: {ltf_signal_details}")
+
+        direction = ltf_signal_details.get("direction")
+        if not direction:
+            print(f"      ERROR: Direction missing in ltf_signal_details.")
+            return None, None
+        
+        print(f"      Direction: {direction}")
+
         sl_price = None
         tp_price = None
         sl_buffer_actual = self.sl_buffer_pips_strat * self.pip_size
+        print(f"      SL Buffer Actual: {sl_buffer_actual:.5f} (Pips: {self.sl_buffer_pips_strat}, PipSize: {self.pip_size})")
         
+        signal_candle_low = ltf_signal_details.get("signal_candle_ha_low")
+        signal_candle_high = ltf_signal_details.get("signal_candle_ha_high")
+
         if direction == "bullish":
-            signal_candle_low = ltf_signal_details.get("signal_candle_ha_low")
             if signal_candle_low is None:
-                print(f"    ERROR ({self.symbol} @ {entry_time}): Missing signal_candle_ha_low for SL calc.")
+                print(f"      ERROR: Missing signal_candle_ha_low for SL calc.")
                 return None, None
+            print(f"      Signal Candle HA Low: {signal_candle_low:.5f}")
             sl_price = signal_candle_low - sl_buffer_actual
+            print(f"      Calculated Bullish SL (pre-validation): {sl_price:.5f}")
         elif direction == "bearish":
-            signal_candle_high = ltf_signal_details.get("signal_candle_ha_high")
             if signal_candle_high is None:
-                print(f"    ERROR ({self.symbol} @ {entry_time}): Missing signal_candle_ha_high for SL calc.")
+                print(f"      ERROR: Missing signal_candle_ha_high for SL calc.")
                 return None, None
+            print(f"      Signal Candle HA High: {signal_candle_high:.5f}")
             sl_price = signal_candle_high + sl_buffer_actual
-        else:
+            print(f"      Calculated Bearish SL (pre-validation): {sl_price:.5f}")
+        else: 
+            print(f"      ERROR: Invalid direction '{direction}' for SL/TP calc.")
             return None, None
 
-        if direction == "bullish" and sl_price >= entry_price - (self.pip_size * 1):
-            return None, None 
-        elif direction == "bearish" and sl_price <= entry_price + (self.pip_size * 1):
-            return None, None
+        # Validate SL
+        min_sl_distance_from_entry = self.pip_size * 1 # Min 1 pip distance
+        if direction == "bullish":
+            if sl_price >= entry_price - min_sl_distance_from_entry:
+                print(f"      VALIDATION FAIL: Bullish SL {sl_price:.5f} too close or above entry threshold {entry_price - min_sl_distance_from_entry:.5f}.")
+                return None, None 
+        elif direction == "bearish":
+            if sl_price <= entry_price + min_sl_distance_from_entry:
+                print(f"      VALIDATION FAIL: Bearish SL {sl_price:.5f} too close or below entry threshold {entry_price + min_sl_distance_from_entry:.5f}.")
+                return None, None
 
         risk_amount_price = abs(entry_price - sl_price)
-        if risk_amount_price < (self.pip_size * 2): 
+        print(f"      Risk Amount Price: {risk_amount_price:.5f}")
+        min_risk_required = self.pip_size * 2
+        if risk_amount_price < min_risk_required: 
+            print(f"      VALIDATION FAIL: Risk amount {risk_amount_price:.5f} too small (min required: {min_risk_required:.5f}).")
             return None, None 
 
         if direction == "bullish":
             tp_price = entry_price + (risk_amount_price * self.tp_rr_ratio)
         elif direction == "bearish":
             tp_price = entry_price - (risk_amount_price * self.tp_rr_ratio)
-            
+        
+        print(f"      Final SL: {sl_price:.5f}, Final TP: {tp_price:.5f if tp_price else 'N/A'}")
         return sl_price, tp_price

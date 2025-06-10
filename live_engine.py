@@ -181,15 +181,12 @@ def run_live_engine():
                                     print(f"    Volume calculation resulted in 0 for {symbol}. No order placed.")
                             else:
                                 print(f"    Invalid SL/TP calculated for {symbol} ({sl_price}, {tp_price}). No order placed.")
-                # End of new entry check
-            # End of symbol processing in loop
             time.sleep(0.05)
 
             for ticket_id_closed in list(portfolio.open_trades.keys()): # Iterate on copy
                 if portfolio.open_trades[ticket_id_closed].symbol == symbol and \
                    portfolio.open_trades[ticket_id_closed].status != "open":
                     portfolio.remove_closed_trade(ticket_id_closed)
-
         time.sleep(POLL_INTERVAL_SECONDS)
 
     except KeyboardInterrupt:
