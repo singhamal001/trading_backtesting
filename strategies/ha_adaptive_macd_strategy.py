@@ -178,5 +178,5 @@ class HAAdaptiveMACDStrategy(BaseStrategy):
         elif direction == "bearish":
             tp_price = entry_price - (risk_amount_price * self.tp_rr_ratio)
         
-        print(f"      Final SL: {sl_price:.5f}, Final TP: {tp_price:.5f if tp_price else 'N/A'}")
+        #print(f"      Final SL: {sl_price:.5f}, Final TP: {tp_price:.5f if tp_price else 'N/A'}")
         return sl_price, tp_price

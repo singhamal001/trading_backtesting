@@ -6,8 +6,8 @@ import pandas as pd
 
 # --- MT5 Connection Configuration ---
 MT5_PATH = r"C:\Program Files\MetaTrader 5\terminal64.exe" 
-ACCOUNT_LOGIN = 686105
-ACCOUNT_PASSWORD = "5rG@EpLd"
+ACCOUNT_LOGIN = 692727
+ACCOUNT_PASSWORD = "TgAmVz!4"
 ACCOUNT_SERVER = "TenTrade-Server"
 
 # --- Timezone Configuration ---
@@ -58,7 +58,7 @@ BREAK_TYPE = "close"
 INITIAL_CAPITAL = 10000
 COMMISSION_PER_TRADE = 0 
 SLIPPAGE_POINTS = 0    
-RISK_PER_TRADE_PERCENT = 1.0 
+RISK_PER_TRADE_PERCENT = 0.6 
 SL_BUFFER_PIPS = 1 
 TP_RR_RATIO = 2.0  
 
