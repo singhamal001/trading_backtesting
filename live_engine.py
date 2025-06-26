@@ -146,11 +146,11 @@ def run_live_engine():
 
                             entry_ref_time = decision_candle_series.name
 
-                            sl_price, tp_price = strategy.calculate_sl_tp(
+                            sl_price_orig, tp_price_orig = strategy.calculate_sl_tp(
                                 entry_ref_price, entry_ref_time, prepared_ltf_df_strat, ltf_signal_live, htf_signal_live
                             )
 
-                            if sl_price and tp_price:
+                            if sl_price_orig and tp_price_orig:
                                 # For live lot calculation, use current market price for more accuracy if possible
                                 current_tick_for_lot_calc = mt5.symbol_info_tick(symbol)
                                 actual_entry_ref_for_lot_calc = entry_ref_price # Default
@@ -161,14 +161,29 @@ def run_live_engine():
                                 
                                 volume = portfolio.calculate_lot_size(symbol, sl_price, actual_entry_ref_for_lot_calc)
                                 if volume > 0:
+                                    # --- NEW: REVERSAL LOGIC ---
+                                    final_direction_str = ltf_signal_live['direction']
+                                    final_sl_price = sl_price_orig
+                                    final_tp_price = tp_price_orig
+                                    trade_comment = f"{active_strategy_name}"
+                        
+                                    if config.REVERSE_TRADES:
+                                        print(f"    >>> REVERSING LIVE TRADE SIGNAL for {symbol} <<<")
+                                        final_direction_str = "bearish" if ltf_signal_live['direction'] == 'bullish' else 'bullish'
+                                        final_sl_price = tp_price_orig
+                                        final_tp_price = sl_price_orig
+                                        trade_comment = f"REVERSED_{active_strategy_name}"
+                                    
+                                    order_mt5_type = mt5.ORDER_TYPE_BUY if final_direction_str == 'bullish' else mt5.ORDER_TYPE_SELL
+                                    # --- END OF REVERSAL LOGIC ---
                                     print(f"    Attempting to open {ltf_signal_live['direction']} for {symbol} vol:{volume:.2f} SL:{sl_price:.5f} TP:{tp_price:.5f}")
-                                    order_mt5_type = mt5.ORDER_TYPE_BUY if ltf_signal_live['direction'] == 'bullish' else mt5.ORDER_TYPE_SELL
+                                    # order_mt5_type = mt5.ORDER_TYPE_BUY if ltf_signal_live['direction'] == 'bullish' else mt5.ORDER_TYPE_SELL
                                     
                                     # --- ACTUAL ORDER PLACEMENT ---
                                     deal_info = broker.place_market_order(
                                         symbol=symbol, order_type=order_mt5_type, volume=volume,
-                                        sl_price=sl_price, tp_price=tp_price,
-                                        magic_number=MAGIC_NUMBER_LIVE, comment=f"{active_strategy_name}"
+                                        sl_price=final_sl_price, tp_price=final_tp_price, # Use final values
+                                        magic_number=MAGIC_NUMBER_LIVE, comment=trade_comment
                                     )
                                     # Check if deal_info is valid and represents a successful trade entry
                                     if deal_info and hasattr(deal_info, 'position_id') and deal_info.position_id > 0 and deal_info.entry == mt5.DEAL_ENTRY_IN:
