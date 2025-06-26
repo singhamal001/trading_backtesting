@@ -13,6 +13,9 @@ ACCOUNT_SERVER = "TenTrade-Server"
 # --- Timezone Configuration ---
 INTERNAL_TIMEZONE = 'UTC'
 
+# --- Live Trading / Backtesting Behavior ---
+REVERSE_TRADES = True # Set to True to reverse all trade signals
+
 # --- Default Backtest Parameters ---
 SYMBOLS = ["EURUSD", "USDJPY", "USDCHF", "USDCAD"] 
 
