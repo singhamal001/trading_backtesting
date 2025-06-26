@@ -278,6 +278,21 @@ def run_backtest(
                             )
                             if sl_price is None or tp_price is None: break 
 
+                            # --- NEW: REVERSAL LOGIC ---
+                            final_direction = ltf_entry_signal["direction"]
+                            final_sl_price = sl_price_orig
+                            final_tp_price = tp_price_orig
+                            trade_comment = ""
+                    
+                            if config.REVERSE_TRADES:
+                                print(f"    REVERSING TRADE SIGNAL for {symbol} at {entry_time}")
+                                final_direction = "bearish" if ltf_entry_signal["direction"] == "bullish" else "bullish"
+                                final_sl_price = tp_price_orig  # Original TP becomes the new SL
+                                final_tp_price = sl_price_orig  # Original SL becomes the new TP
+                                trade_comment = "REVERSED"
+                    
+                            # --- END OF REVERSAL LOGIC ---
+
                             current_overall_trade_id += 1 
                             print(f"    {entry_time}: LTF ENTRY SIGNAL ({strategy_name})! Type: {ltf_entry_signal['type']}, Price: {entry_price:.5f}")
                             active_trade = {
